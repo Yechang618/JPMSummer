@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import os
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
 import tensorflow as tf
 import tensorflow_probability as tfp
 
