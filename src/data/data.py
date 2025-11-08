@@ -157,9 +157,10 @@ if __name__ == "__main__":
     print(y.numpy())
     print("SSMData demo completed.")
     pass
+
 def test_1d():
     try:
-        from src.models.KalmanFilter import KalmanFilter
+        from models.KalmanFilter import KalmanFilter
     except Exception as e:
         print("SKIP test_1d: failed to import KalmanFilter:", e)
         return True
@@ -194,7 +195,7 @@ def test_1d():
     return rmse < 1.0
 def test_2d():
     try:
-        from src.models.KalmanFilter import KalmanFilter
+        from models.KalmanFilter import KalmanFilter
     except Exception as e:
         print("SKIP test_2d: failed to import KalmanFilter:", e)
         return True

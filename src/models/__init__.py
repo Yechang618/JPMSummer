@@ -6,5 +6,6 @@ notebook import `from src.models import KalmanFilter as kf` works and
 """
 
 from . import KalmanFilter  # noqa: F401  (expose submodule)
+from . import ExtendedKalmanFilter  # noqa: F401  (expose EKF module)
 
-__all__ = ["KalmanFilter"]
+__all__ = ["KalmanFilter", "ExtendedKalmanFilter"]
