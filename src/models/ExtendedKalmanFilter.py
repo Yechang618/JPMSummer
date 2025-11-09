@@ -63,6 +63,69 @@ class ExtendedKalmanFilter:
 
         assert tuple(self.Q.shape) == (self.state_dim, self.state_dim)
         assert tuple(self.R.shape) == (self.obs_dim, self.obs_dim)
+        # initialize running state for step() convenience (keeps filter stateful)
+        self.m = tf.identity(self.m0)
+        self.P = tf.identity(self.P0)
+
+    def reset(self) -> None:
+        """Reset the internal filter state to the initial mean/covariance."""
+        self.m = tf.identity(self.m0)
+        self.P = tf.identity(self.P0)
+
+    def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Perform a single predict-update step and update internal state.
+
+        Parameters
+        ----------
+        observation : array-like or tf.Tensor
+            Observation for the current time step (obs_dim,) or scalar for 1D.
+
+        Returns
+        -------
+        m : tf.Tensor
+            Posterior mean after update (state_dim,)
+        P : tf.Tensor
+            Posterior covariance after update (state_dim, state_dim)
+        loglik : tf.Tensor
+            Log-likelihood contribution for this observation (scalar)
+        """
+        y = tf.convert_to_tensor(observation, dtype=self.dtype)
+        # normalize shape
+        if y.shape.rank == 1 and tf.shape(y)[0] != self.obs_dim:
+            y = tf.reshape(y, (self.obs_dim,))
+        elif y.shape.rank == 0:
+            y = tf.reshape(y, (1,))
+
+        I = tf.eye(self.state_dim, dtype=self.dtype)
+
+        # Predict
+        m_pred = tf.convert_to_tensor(self.f(self.m), dtype=self.dtype)
+        F = self._jacobian(self.f, self.m)
+        P_pred = F @ self.P @ tf.transpose(F) + self.Q
+
+        # Innovation
+        y_pred = tf.convert_to_tensor(self.h(m_pred), dtype=self.dtype)
+        H = self._jacobian(self.h, m_pred)
+        S = H @ P_pred @ tf.transpose(H) + self.R
+
+        # Kalman gain via Cholesky solve for numerical stability
+        chol_S = tf.linalg.cholesky(S)
+        K = tf.linalg.matmul(P_pred, tf.transpose(H))
+        K = tf.linalg.cholesky_solve(chol_S, tf.transpose(K))
+        K = tf.transpose(K)
+
+        innovation = y - y_pred
+
+        # Update
+        self.m = m_pred + tf.linalg.matvec(K, innovation)
+        KH = K @ H
+        self.P = (I - KH) @ P_pred @ tf.transpose(I - KH) + KH @ self.R @ tf.transpose(KH)
+
+        # Log-likelihood for this observation
+        mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
+        loglik = mvn.log_prob(y)
+
+        return self.m, self.P, loglik
 
     def _jacobian(self, func: Callable[[tf.Tensor], tf.Tensor], x: tf.Tensor) -> tf.Tensor:
         """Compute Jacobian of func at x using tf.GradientTape.

@@ -101,6 +101,74 @@ class UnscentedKalmanFilter:
 
         # Calculate weights
         self._calculate_weights()
+        # initialize running state for step() convenience (keeps filter stateful)
+        self.m = tf.identity(self.m0)
+        self.P = tf.identity(self.P0)
+
+    def reset(self) -> None:
+        """Reset the internal filter state to the initial mean/covariance."""
+        self.m = tf.identity(self.m0)
+        self.P = tf.identity(self.P0)
+
+    def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Perform a single predict-update step (stateful) and return posterior.
+
+        Parameters
+        ----------
+        observation : array-like or tf.Tensor
+            Observation for the current time step (obs_dim,) or scalar for 1D.
+
+        Returns
+        -------
+        m : tf.Tensor
+            Posterior mean after update (state_dim,)
+        P : tf.Tensor
+            Posterior covariance after update (state_dim, state_dim)
+        loglik : tf.Tensor
+            Log-likelihood contribution for this observation (scalar)
+        """
+        y = tf.convert_to_tensor(observation, dtype=self.dtype)
+        # normalize shape for scalar observations
+        if y.shape.rank == 0:
+            y = tf.reshape(y, (1,))
+
+        # Generate sigma points from current state
+        chi = self._generate_sigma_points(self.m, self.P)
+
+        # Predict step: propagate sigma points through dynamics
+        chi_pred = tf.map_fn(self.f, chi)
+        m_pred = tf.reduce_sum(self.wm[:, None] * chi_pred, axis=0)
+
+        # Covariance prediction
+        diffs = chi_pred - m_pred
+        wc_reshaped = tf.reshape(self.wc, [-1, 1])
+        P_pred = tf.transpose(diffs) @ (wc_reshaped * diffs)
+        P_pred = tf.cast(P_pred, dtype=self.dtype) + self.Q
+
+        # Observation prediction
+        chi_y = self._generate_sigma_points(m_pred, P_pred)
+        gamma = tf.map_fn(self.h, chi_y)
+        y_pred = tf.reduce_sum(self.wm[:, None] * gamma, axis=0)
+
+        diffs_x = chi_y - m_pred
+        diffs_y = gamma - y_pred
+        wc_reshaped = tf.reshape(self.wc, [-1, 1])
+
+        S = tf.transpose(diffs_y) @ (wc_reshaped * diffs_y)
+        Pxy = tf.transpose(diffs_x) @ (wc_reshaped * diffs_y)
+        S = tf.cast(S, dtype=self.dtype) + self.R
+
+        # Kalman gain and update
+        K = Pxy @ tf.linalg.inv(S)
+        innovation = y - y_pred
+        self.m = m_pred + tf.linalg.matvec(K, innovation)
+        self.P = P_pred - K @ S @ tf.transpose(K)
+
+        # Log-likelihood for this observation
+        mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
+        loglik = mvn.log_prob(y)
+
+        return self.m, self.P, loglik
 
     def _calculate_weights(self) -> None:
         """Calculate UKF weights for mean and covariance."""
@@ -240,6 +308,7 @@ class UnscentedKalmanFilter:
         filtered_covs = filtered_covs.stack()
         
         return filtered_means, filtered_covs, total_loglik
+    
 
 
 def _simulate_van_der_pol(T=50, seed: int = 1):

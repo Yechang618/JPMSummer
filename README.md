@@ -38,6 +38,10 @@ This project implements Kalman filtering tools using TensorFlow and TensorFlow P
 - Support for 1D and multi-dimensional state spaces
 - Log-likelihood computation for model comparison and diagnostics
 - Example notebook for stock data analysis
+ - Particle Filter (PF) implementation with diagnostics:
+     - Tracks effective sample size (ESS) and normalized particle weights per step
+     - Provides `last_ess`, `ess_history` and `weights_history` attributes for plotting degeneracy
+     - See `kalman_filter_demo.ipynb` for an ESS visualization and particle-count sweep example
 
 ## Installation
 
