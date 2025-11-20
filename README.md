@@ -46,133 +46,70 @@ This project implements Kalman filtering tools using TensorFlow and TensorFlow P
 ## Installation
 
 ### Prerequisites
+# JPMSummer
 
-- Python 3.8 or later
-- pip (Python package installer)
+This repository contains implementations of Kalman filters and particle filters, plus experiment scripts comparing methods (Kalman Filter, UKF, Bootstrap PF, PF-PF with Daum–Huang flows, EDH, LEDH).
 
-### Quick Install
+**Features**
+- **Kalman & EKF**: Linear Kalman filter and Extended Kalman Filter (EKF) implemented with TensorFlow and automatic differentiation.
+- **Unscented Kalman Filter (UKF)**: Implemented with numerically-stable updates.
+- **Particle Filters**: Bootstrap PF and PF-PF (Particle Flow Proposal) with global (IEDH) and local (ILEDH / LEDH) invertible Daum–Huang flows.
+- **Flows & Diagnostics**: Robust linear-algebra helpers (`_safe_cholesky`, `_safe_inv`) with optional debug tracing (`PF_PF_DEBUG` env var).
+- **Experiments**: `experiments_pf_pf.py` contains comparison experiments and a sensitivity study `experiment_linear_gaussian_part2` that perturbs predictive covariances.
 
-```bash
-# Install from source (recommended for development)
+**Quick Notes**
+- **Debug**: set `PF_PF_DEBUG=1` to enable diagnostic prints from PF-PF helpers (shows min eigenvalues and jitter escalation). In PowerShell: `$env:PF_PF_DEBUG='1'`.
+- **Smoke tests**: many experiments support a `smoke` flag or small defaults for quick validation.
+
+**Project Structure**
+- **`src/models/`**: Kalman, EKF, UKF, ParticleFilter, PF_PF (flows), EDH, LEDH implementations.
+- **`experiments_pf_pf.py`**: experiment harnesss (acoustic tracking, linear Gaussian spatial network, skewed-t counts) and the sensitivity experiment `experiment_linear_gaussian_part2`.
+- **`test/`**: unit tests.
+
+**Dependencies**
+- Python 3.8+; tested with Python 3.11
+- Required (examples): `numpy`, `tensorflow`, `tensorflow_probability`, `scipy`
+- Install with pip (recommended in a venv):
+```powershell
 python -m pip install -e .
-
-# Install with development tools (pytest, black, etc.)
-python -m pip install -e ".[dev]"
-
-# Ensure TensorFlow and TensorFlow Probability are installed (required for EKF tests)
-python -m pip install "tensorflow>=2.10" "tensorflow-probability>=0.18"
+python -m pip install "tensorflow>=2.10" "tensorflow-probability>=0.18" scipy
 ```
 
-### Dependencies
-
-Core dependencies (installed automatically):
-- tensorflow >= 2.10.0
-- tensorflow-probability >= 0.18.0
-- numpy >= 1.19.0
-
-Development dependencies (optional):
-- pytest >= 7.0
-- black
-- flake8
-- mypy
-
-## Project Structure
-
+**Running experiments**
+- Run the default experiments script (calls `experiment_linear_gaussian` by default):
+```powershell
+python experiments_pf_pf.py
 ```
-jpm-project/
-├── src/
-│   ├── models/
-│   │   ├── KalmanFilter.py    # Linear Kalman filter (TensorFlow)
-│   │   └── ExtendedKalmanFilter.py  # EKF (TensorFlow + TFP)
-│   └── data/                  # Data loading and processing utilities
-├── test/
-│   ├── test_kalman.py         # Linear Kalman filter tests
-│   └── test_extended_kalman.py# Extended Kalman filter tests
-├── scripts/
-│   └── run_kalman_tests.py   # Optional standalone test runner
-└── Test.ipynb                # Example notebook
+- Run the sensitivity experiment (perturbed predictive covariance) from Python:
+```powershell
+python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=10, trials=5, Np=500, sigma_p_list=[0.0,0.1,0.2], smoke=False)"
+```
+- Quick smoke test (fast):
+```powershell
+python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=3, trials=2, Np=50, sigma_p_list=[0.0,0.2], smoke=True)"
 ```
 
-## Usage
-
-### Linear Kalman Filter (TensorFlow)
-
-```python
-import numpy as np
-from src.models.KalmanFilter import KalmanFilter
-
-# Create a simple 1D Kalman filter
-kf = KalmanFilter(
-    transition_matrix=np.array([[1.0]]),      # State stays constant
-    observation_matrix=np.array([[1.0]]),     # Observe state directly
-    transition_cov=np.array([[0.1]]),         # Small state noise
-    observation_cov=np.array([[0.5]]),        # Larger observation noise
-    initial_mean=np.zeros((1,)),              # Start at zero
-    initial_cov=np.eye(1),                    # Prior uncertainty
-)
-
-# Filter some observations (shape (T, obs_dim))
-observations = np.array([[1.0], [1.1], [0.9], [1.2]])
-filtered_means, filtered_covs, loglik = kf.filter(observations)
+**Enabling PF-PF diagnostics**
+- PowerShell:
+```powershell
+$env:PF_PF_DEBUG='1'
+python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=5, trials=2, Np=200, sigma_p_list=[0.0,0.2], smoke=True)"
 ```
-
-### Extended (nonlinear) Kalman Filter (EKF)
-
-The EKF uses TensorFlow automatic differentiation to compute Jacobians. Provide `f` and `h` using TensorFlow ops.
-
-```python
-import tensorflow as tf
-from src.models import ExtendedKalmanFilter
-
-def f(x: tf.Tensor) -> tf.Tensor:
-    return x + 0.05 * tf.square(x)
-
-def h(x: tf.Tensor) -> tf.Tensor:
-    return x + 0.1 * tf.square(x)
-
-ekf = ExtendedKalmanFilter(
-    f=f,
-    h=h,
-    Q=tf.constant([[0.01]], dtype=tf.float64),
-    R=tf.constant([[0.1]], dtype=tf.float64),
-    initial_mean=tf.constant([0.0], dtype=tf.float64),
-    initial_cov=tf.constant([[1.0]], dtype=tf.float64),
-)
-
-# observations can be a NumPy 1D array or TF tensor; outputs are TF tensors
-means, covs, loglik = ekf.filter(observations)
-print(means.numpy()[:5])
-```
-
-## Running Tests
-
+- Bash/macOS/Linux:
 ```bash
-# Run all tests (requires TensorFlow and TFP for EKF tests)
-pytest
-
-# Run specific test files
-pytest test/test_kalman.py
-pytest test/test_extended_kalman.py
-
-# Run standalone tests (if provided)
-python scripts/run_kalman_tests.py
+PF_PF_DEBUG=1 python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=5, trials=2, Np=200, sigma_p_list=[0.0,0.2], smoke=True)"
 ```
 
-If you don't have dev dependencies installed yet, install them with:
+**Notes on numerical stability**
+- The PF-PF flows use Cholesky and matrix inversions; we add tiny diagonal jitter and attempt increasing jitter when operations fail. Use `PF_PF_DEBUG=1` to see jitter/diagnostic messages.
+- For large `d` and large `Np` experiments, prefer running smoke/medium runs first to confirm numerical stability and resource usage.
 
-```bash
-python -m pip install -e ".[dev]"
-python -m pip install "tensorflow>=2.10" "tensorflow-probability>=0.18"
-```
+If you'd like, I can:
+- add capture-and-save for matrices that trigger jitter escalation, or
+- run the full-scale sensitivity experiment (trials=100, T=10, Np=10000) — note this is computationally heavy and may take a long time.
 
 ## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Follow the normal fork → branch → PR workflow. Keep changes small and test locally with smoke runs before pushing.
 
 ## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see `LICENSE`.
