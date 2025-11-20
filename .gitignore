@@ -181,5 +181,5 @@ cython_debug/
 .cursorindexingignore
 
 # Other ignores
-./vscode
-./vscode/.
+.vscode
+.vscode/

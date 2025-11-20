@@ -58,6 +58,7 @@ class KalmanFilter:
         initial_mean,
         initial_cov,
         dtype: tf.DType = tf.float64,
+        verbose_or_not: bool = False,
     ) -> None:
         self.dtype = dtype
         self.A = tf.convert_to_tensor(transition_matrix, dtype=self.dtype)
@@ -66,6 +67,7 @@ class KalmanFilter:
         self.R = tf.convert_to_tensor(observation_cov, dtype=self.dtype)
         self.m0 = tf.convert_to_tensor(initial_mean, dtype=self.dtype)
         self.P0 = tf.convert_to_tensor(initial_cov, dtype=self.dtype)
+        self.verbose = bool(verbose_or_not)
 
         # Dimensions check
         self.state_dim = int(self.A.shape[0])
@@ -105,6 +107,13 @@ class KalmanFilter:
         # Loop over time steps. We keep this simple and readable.
         for t in tf.range(T):
             y = observations[t]
+
+            if self.verbose:
+                try:
+                    t_val = int(t.numpy())
+                except Exception:
+                    t_val = int(t)
+                print(f"KalmanFilter: filtering step t={t_val}")
 
             # Predict
             m_pred = tf.linalg.matvec(self.A, m)

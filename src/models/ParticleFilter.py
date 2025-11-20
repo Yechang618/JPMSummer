@@ -72,12 +72,14 @@ class ParticleFilter:
         initial_cov: Optional[tf.Tensor] = None,
         dtype: tf.DType = tf.float64,
         seed: Optional[int] = None,
+        verbose_or_not: bool = False,
     ) -> None:
         self.f = transition_fn
         self.h = observation_fn
         self.dtype = dtype
         self.num_particles = int(num_particles)
         self._rng = np.random.default_rng(seed)
+        self.verbose = bool(verbose_or_not)
 
         # Convert covariances
         self.Q = tf.convert_to_tensor(Q, dtype=self.dtype)
@@ -164,12 +166,15 @@ class ParticleFilter:
 
     def predict(self) -> None:
         """Propagate particles through transition and add process noise."""
+        if self.verbose:
+            print(f"ParticleFilter: predict() propagating {self.num_particles} particles")
         # Apply transition function elementwise. We vectorize via map_fn.
         # Input particles has shape (N, state_dim). map_fn will pass each row.
         particles_pred = tf.map_fn(self.f, self.particles, fn_output_signature=tf.float64)
 
         # Add process noise samples
         q_dist = tfd.MultivariateNormalTriL(loc=tf.zeros(self.state_dim, dtype=self.dtype), scale_tril=self._Q_tril)
+        # noise size (N, state_dim)
         noise = q_dist.sample(self.num_particles)
         noise = tf.cast(noise, dtype=self.dtype)
 
@@ -193,6 +198,9 @@ class ParticleFilter:
         mvn = tfd.MultivariateNormalTriL(loc=preds, scale_tril=self._R_tril)
         # mvn.log_prob accepts batch loc shape (N, obs_dim) and returns (N,)
         log_likes = mvn.log_prob(y)
+
+        if self.verbose:
+            print("ParticleFilter: update() computing log-likelihoods and updating weights")
 
         # Update log-weights: prior log_weights + log_likes
         new_log_w = self.log_weights + log_likes
@@ -221,12 +229,21 @@ class ParticleFilter:
 
         # Resample if ESS below threshold (N/2)
         threshold = tf.cast(self.num_particles / 2.0, dtype=self.dtype)
+        resampled = False
         if ess < threshold:
             idx = self._systematic_resample(weights)
             # gather particles
             self.particles = tf.gather(self.particles, idx)
             # reset weights to uniform in log-space
             self.log_weights = tf.fill([self.num_particles], tf.math.log(1.0 / tf.cast(self.num_particles, self.dtype)))
+            resampled = True
+
+        if self.verbose:
+            try:
+                ess_val = float(ess.numpy())
+            except Exception:
+                ess_val = float(ess)
+            print(f"ParticleFilter: update() done; ESS={ess_val:.2f}; resampled={resampled}")
 
         # Return approximate log-likelihood (log p(y))
         return log_norm_const
@@ -247,13 +264,19 @@ class ParticleFilter:
         # Covariance: sum w_i * (diff_i @ diff_i^T)
         cov = tf.transpose(diff) @ (tf.expand_dims(w, -1) * diff)
         cov = tf.cast(cov, dtype=self.dtype)
+        if self.verbose:
+            print("ParticleFilter: estimate() returning mean and covariance")
         return mean, cov
 
     def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Perform a predict-update cycle and return estimate and loglik."""
+        if self.verbose:
+            print("ParticleFilter: step() starting predict-update cycle")
         self.predict()
         loglik = self.update(observation)
         mean, cov = self.estimate()
+        if self.verbose:
+            print("ParticleFilter: step() finished")
         return mean, cov, loglik
 
 

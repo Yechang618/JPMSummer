@@ -85,8 +85,8 @@ class SSMData:
         state_dim = self.A.shape[0]
         obs_dim = self.H.shape[0]
 
-        x = tf.TensorArray(self.dtype, size=num_steps + 1)
-        y = tf.TensorArray(self.dtype, size=num_steps)
+        x = tf.TensorArray(dtype=self.dtype, size=num_steps + 1, clear_after_read=False)
+        y = tf.TensorArray(dtype=self.dtype, size=num_steps, clear_after_read=False)
 
         x = x.write(0, self.initial_mean)
 
@@ -297,8 +297,8 @@ class StochasticVolatilityData:
         y : tf.Tensor, shape (num_steps,)
             The generated returns
         """
-        h = tf.TensorArray(self.dtype, size=num_steps + 1)
-        y = tf.TensorArray(self.dtype, size=num_steps)
+        h = tf.TensorArray(dtype=self.dtype, size=num_steps + 1, clear_after_read=False)
+        y = tf.TensorArray(dtype=self.dtype, size=num_steps, clear_after_read=False)
         
         h = h.write(0, self.initial_logvol)
         
@@ -323,6 +323,74 @@ class StochasticVolatilityData:
             y = y.write(t - 1, y_t)
         
         return h.stack(), y.stack()
+
+class StochasticVariationalData:
+    """A simple stochastic variational model data generator.
+
+    Implements the model
+        X_k = alpha * X_{k-1} + sigma * eta_k,   eta_k ~ N(0,1)
+        Y_k = beta * exp(X_k / 2) * epsilon_k,   epsilon_k ~ N(0,1)
+
+    This is a scalar (1D) latent state / observation implementation.
+
+    Parameters
+    ----------
+    alpha : float
+        AR(1) coefficient for the latent state
+    sigma : float
+        Scale of the process noise (multiplies standard normal eta)
+    beta : float
+        Observation scale factor (multiplies exp(X_k/2) and observation noise)
+    initial_state : float, optional
+        Initial latent state X_0 (defaults to 0.0)
+    dtype : tf.DType, default tf.float64
+    """
+    def __init__(
+        self,
+        alpha: float,
+        sigma: float,
+        beta: float,
+        initial_state: Optional[float] = 0.0,
+        dtype: tf.DType = tf.float64,
+    ) -> None:
+        self.dtype = dtype
+        self.alpha = tf.convert_to_tensor(alpha, dtype=self.dtype)
+        self.sigma = tf.convert_to_tensor(sigma, dtype=self.dtype)
+        self.beta = tf.convert_to_tensor(beta, dtype=self.dtype)
+        if initial_state is None:
+            initial_state = 0.0
+        self.initial_state = tf.convert_to_tensor(initial_state, dtype=self.dtype)
+
+    def sample(self, num_steps: int, seed: Optional[int] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Generate samples of latent states and observations.
+
+        Returns
+        -------
+        x : tf.Tensor, shape (num_steps + 1,)
+            Latent states (including initial state at index 0)
+        y : tf.Tensor, shape (num_steps,)
+            Observations
+        """
+        x = tf.TensorArray(dtype=self.dtype, size=num_steps + 1, clear_after_read=False)
+        y = tf.TensorArray(dtype=self.dtype, size=num_steps, clear_after_read=False)
+
+        x = x.write(0, self.initial_state)
+
+        for t in range(1, num_steps + 1):
+            if seed is not None:
+                eta = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(seed=seed + t), dtype=self.dtype)
+                eps = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(seed=seed + t + num_steps), dtype=self.dtype)
+            else:
+                eta = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(), dtype=self.dtype)
+                eps = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(), dtype=self.dtype)
+
+            x_prev = x.read(t - 1)
+            x_t = self.alpha * x_prev + self.sigma * eta
+            x = x.write(t, x_t)
+            y_t = self.beta * tf.exp(x_t / 2.0) * eps
+            y = y.write(t - 1, y_t)
+
+        return x.stack(), y.stack()
 
 def test_stochastic_volatility():
     """Test the stochastic volatility model implementation."""

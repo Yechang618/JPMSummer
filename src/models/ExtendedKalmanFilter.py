@@ -47,6 +47,7 @@ class ExtendedKalmanFilter:
         initial_mean,
         initial_cov,
         dtype: tf.DType = tf.float64,
+        verbose_or_not: bool = False,
     ) -> None:
         self.f = f
         self.h = h
@@ -57,12 +58,15 @@ class ExtendedKalmanFilter:
 
         self.m0 = tf.convert_to_tensor(initial_mean, dtype=self.dtype)
         self.P0 = tf.convert_to_tensor(initial_cov, dtype=self.dtype)
+        self.verbose = bool(verbose_or_not)
 
         self.state_dim = int(self.P0.shape[0])
         self.obs_dim = int(self.R.shape[0])
 
+        # Validate dimensions
         assert tuple(self.Q.shape) == (self.state_dim, self.state_dim)
         assert tuple(self.R.shape) == (self.obs_dim, self.obs_dim)
+        
         # initialize running state for step() convenience (keeps filter stateful)
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
@@ -97,6 +101,9 @@ class ExtendedKalmanFilter:
             y = tf.reshape(y, (1,))
 
         I = tf.eye(self.state_dim, dtype=self.dtype)
+
+        if self.verbose:
+            print("ExtendedKalmanFilter: step() starting")
 
         # Predict
         m_pred = tf.convert_to_tensor(self.f(self.m), dtype=self.dtype)

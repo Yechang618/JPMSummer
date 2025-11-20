@@ -69,6 +69,7 @@ class UnscentedKalmanFilter:
         beta: float = 2.0,
         kappa: Optional[float] = None,
         dtype: tf.DType = tf.float64,
+        verbose_or_not: bool = False,
     ) -> None:
         # Save functions and dtype
         self.f = f
@@ -100,10 +101,13 @@ class UnscentedKalmanFilter:
         self.lambda_ = (self.alpha ** 2) * (n + self.kappa) - n
 
         # Calculate weights
+        # Obtained as tf.Tensor attributes: self.wm, self.wc
+        
         self._calculate_weights()
         # initialize running state for step() convenience (keeps filter stateful)
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
+        self.verbose = bool(verbose_or_not)
 
     def reset(self) -> None:
         """Reset the internal filter state to the initial mean/covariance."""
@@ -135,6 +139,9 @@ class UnscentedKalmanFilter:
         # Generate sigma points from current state
         chi = self._generate_sigma_points(self.m, self.P)
 
+        if self.verbose:
+            print("UnscentedKalmanFilter: step() generating sigma points and performing predict-update")
+
         # Predict step: propagate sigma points through dynamics
         chi_pred = tf.map_fn(self.f, chi)
         m_pred = tf.reduce_sum(self.wm[:, None] * chi_pred, axis=0)
@@ -162,7 +169,18 @@ class UnscentedKalmanFilter:
         K = Pxy @ tf.linalg.inv(S)
         innovation = y - y_pred
         self.m = m_pred + tf.linalg.matvec(K, innovation)
-        self.P = P_pred - K @ S @ tf.transpose(K)
+
+        # Joseph-form covariance update for numerical stability.
+        # Estimate an effective linearized observation matrix H such that
+        # Pxy = P_pred @ H^T  => H^T = P_pred^{-1} @ Pxy
+        # Then KH = K @ H and Joseph form: (I - KH) P_pred (I - KH)^T + K R K^T
+        P_pred_inv = tf.linalg.inv(P_pred)
+        H_est = tf.transpose(P_pred_inv @ Pxy)  # shape (obs_dim, state_dim)
+        KH = K @ H_est
+        I = tf.eye(self.state_dim, dtype=self.dtype)
+        self.P = (I - KH) @ P_pred @ tf.transpose(I - KH) + K @ self.R @ tf.transpose(K)
+        # Enforce symmetry to reduce numerical asymmetry
+        self.P = 0.5 * (self.P + tf.transpose(self.P))
 
         # Log-likelihood for this observation
         mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
@@ -291,11 +309,18 @@ class UnscentedKalmanFilter:
             
             # Kalman gain
             K = Pxy @ tf.linalg.inv(S)
-            
+
             # Update
             innovation = y - y_pred
             m = m_pred + tf.linalg.matvec(K, innovation)
-            P = P_pred - K @ S @ tf.transpose(K)
+
+            # Joseph-form covariance update (estimate H via sigma-point covariances)
+            P_pred_inv = tf.linalg.inv(P_pred)
+            H_est = tf.transpose(P_pred_inv @ Pxy)
+            KH = K @ H_est
+            I = tf.eye(self.state_dim, dtype=self.dtype)
+            P = (I - KH) @ P_pred @ tf.transpose(I - KH) + K @ self.R @ tf.transpose(K)
+            P = 0.5 * (P + tf.transpose(P))
             
             # Log-likelihood
             mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)

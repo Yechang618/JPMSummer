@@ -24,6 +24,11 @@ References:
 - Daum, F., & Huang, J. (2008). "Particle flow for nonlinear filters" (and later work)
 """
 
+import os
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+
 from typing import Callable, Optional
 import numpy as np
 import tensorflow as tf
@@ -32,9 +37,9 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 
 
-class DaumHuangFlow:
+class LEDH:
     """
-    Exact Daum-Huang affine particle flow for linear-Gaussian likelihoods.
+    Local Exact Daum-Huang affine particle flow for linear-Gaussian likelihoods.
 
     This class assumes the observation model is linear:
         y = H x + noise,   noise ~ N(0, R)
@@ -118,81 +123,109 @@ class DaumHuangFlow:
         cov += tf.eye(self.state_dim, dtype=self.dtype) * tf.cast(self.jitter, self.dtype)
         return mean, cov
 
-    def update(self, y: tf.Tensor, H: tf.Tensor, R: tf.Tensor):
+    def update(self, y: tf.Tensor, H: Optional[tf.Tensor] = None, R: Optional[tf.Tensor] = None, h_func: Optional[Callable[[tf.Tensor], tf.Tensor]] = None):
         """
-        Apply the Daum-Huang exact flow to move particles to posterior for
-        linear observation y = H x + noise, noise ~ N(0, R).
+        Apply the Local Exact Daum-Huang flow to move particles to posterior.
 
-        Args:
-            y: observation vector shape [obs_dim] or [obs_dim, 1]
-            H: observation matrix shape [obs_dim, state_dim]
-            R: observation covariance shape [obs_dim, obs_dim]
+        This implements LEDH: each particle is locally linearized using the
+        Jacobian of the observation function `h_func` at that particle. For
+        purely linear observation models you may pass `H` (matrix) instead.
+
+        Parameters
+        ----------
+        y : tf.Tensor
+            Observation vector shape [obs_dim] or [obs_dim, 1]
+        H : tf.Tensor, optional
+            Linear observation matrix (obs_dim x state_dim). If provided, a
+            shared linearization is used for all particles.
+        R : tf.Tensor
+            Observation noise covariance (obs_dim x obs_dim)
+        h_func : callable, optional
+            Observation function h(x) -> y. If provided, the Jacobian of
+            `h_func` at each particle is used as the local H_i.
         """
         if self.particles is None:
             raise RuntimeError("Particles not initialized")
 
         # Cast inputs
         y = tf.cast(tf.reshape(y, [-1]), dtype=self.dtype)
-        H = tf.cast(H, dtype=self.dtype)
+        if R is None:
+            raise ValueError("Observation covariance R must be provided")
         R = tf.cast(R, dtype=self.dtype)
 
         # Empirical prior mean and covariance from current particles
         m0, P0 = self._empirical_mean_and_cov(self.particles)
 
-        # Precompute inverses
+        # Precompute common inverses
         P0_inv = tf.linalg.inv(P0)
         R_inv = tf.linalg.inv(R)
 
-        # We'll step in lambda from 0 -> 1
-        lambdas = tf.linspace(0.0, 1.0, self.n_flow_steps + 1)[1:]  # exclude 0.0
+        # Number of particles
+        N = int(self.num_particles)
 
-        # Initialize previous mean/cov to prior
-        m_prev = m0
-        P_prev = P0
+        # Determine per-particle linearization H_i
+        if h_func is not None:
+            # Compute Jacobian of h_func at each particle (obs_dim x state_dim)
+            H_list = []
+            for i in range(N):
+                x_i = tf.reshape(self.particles[i], [self.state_dim])
+                with tf.GradientTape() as tape:
+                    tape.watch(x_i)
+                    y_i = tf.convert_to_tensor(h_func(x_i), dtype=self.dtype)
+                J = tape.jacobian(y_i, x_i)
+                J = tf.reshape(J, (tf.shape(y_i)[0], tf.shape(x_i)[0]))
+                H_list.append(J)
+            H_stack = tf.stack(H_list, axis=0)  # shape (N, obs_dim, state_dim)
+        else:
+            if H is None:
+                raise ValueError("Either H matrix or h_func callable must be provided")
+            H = tf.cast(H, dtype=self.dtype)
+            # same H for all particles
+            H_stack = tf.tile(tf.expand_dims(H, axis=0), [N, 1, 1])
 
-        x = self.particles
+        # Prepare per-particle previous mean/cov (start from global prior)
+        m_prev = [m0 for _ in range(N)]
+        P_prev = [P0 for _ in range(N)]
 
-        # Loop over lambda steps and apply affine transforms
+        # Current particles as list for in-place updates
+        x_list = [tf.reshape(self.particles[i], [-1]) for i in range(N)]
+
+        # Step through lambda and apply local affine transforms per particle
+        lambdas = tf.linspace(0.0, 1.0, self.n_flow_steps + 1)[1:]
         for lam in lambdas:
             lam = tf.cast(lam, dtype=self.dtype)
+            for i in range(N):
+                Hi = tf.cast(H_stack[i], dtype=self.dtype)  # (obs_dim, state_dim)
+                Ht_Rinv = tf.matmul(tf.transpose(Hi), R_inv)
+                S = P0_inv + lam * tf.matmul(Ht_Rinv, Hi)  # (d,d)
+                P_lam = tf.linalg.inv(S)
 
-            # Compute P(lambda) = inv(P0_inv + lam H^T R^{-1} H)
-            Ht_Rinv = tf.matmul(tf.transpose(H), R_inv)
-            S = P0_inv + lam * tf.matmul(Ht_Rinv, H)  # [d,d]
-            P_lam = tf.linalg.inv(S)
+                rhs = tf.matmul(P0_inv, tf.reshape(m0, [-1, 1])) + lam * tf.matmul(Ht_Rinv, tf.reshape(y, [-1, 1]))
+                m_lam = tf.reshape(tf.matmul(P_lam, rhs), [-1])
 
-            # Compute m(lambda) = P(lambda) (P0_inv m0 + lam H^T R^{-1} y)
-            rhs = tf.matmul(P0_inv, tf.reshape(m0, [-1, 1])) + lam * tf.matmul(Ht_Rinv, tf.reshape(y, [-1, 1]))
-            m_lam = tf.reshape(tf.matmul(P_lam, rhs), [-1])
+                chol_prev = tf.linalg.cholesky(P_prev[i])
+                chol_lam = tf.linalg.cholesky(P_lam)
+                I = tf.eye(self.state_dim, dtype=self.dtype)
+                inv_chol_prev = tf.linalg.triangular_solve(chol_prev, I, lower=True)
+                A = tf.matmul(chol_lam, inv_chol_prev)
 
-            # Compute affine transform A mapping N(m_prev, P_prev) -> N(m_lam, P_lam)
-            # A = chol(P_lam) @ inv(chol(P_prev))
-            chol_prev = tf.linalg.cholesky(P_prev)
-            chol_lam = tf.linalg.cholesky(P_lam)
+                centered = x_list[i] - m_prev[i]
+                updated = tf.matmul(A, tf.reshape(centered, [-1, 1]))
+                updated = tf.reshape(updated, [-1]) + m_lam
 
-            # Solve for inv(chol_prev) efficiently using triangular solve
-            # We want A = chol_lam @ inv(chol_prev). For a vector v: inv(chol_prev) v = triangular_solve(chol_prev, v, lower=True)
-            # We'll apply to (x - m_prev)^T when updating particles.
-            # Build transformation matrix A explicitly (state_dim small typically)
-            I = tf.eye(self.state_dim, dtype=self.dtype)
-            inv_chol_prev = tf.linalg.triangular_solve(chol_prev, I, lower=True)
-            A = tf.matmul(chol_lam, inv_chol_prev)
+                x_list[i] = updated
 
-            # Apply affine transform to particles: x_new = m_lam + A @ (x - m_prev)
-            centered = tf.transpose(tf.transpose(x) - m_prev)  # shape [N, d]
-            # Compute A @ centered^T -> result [d, N], transpose back
-            updated = tf.transpose(tf.matmul(A, tf.transpose(centered))) + m_lam
+                # store histories
+                self.mean_history.append(m_lam.numpy())
+                self.cov_history.append(P_lam.numpy())
 
-            x = updated
+                # advance per-particle
+                m_prev[i] = m_lam
+                P_prev[i] = P_lam
 
-            # Store histories and advance
-            self.mean_history.append(m_lam.numpy())
-            self.cov_history.append(P_lam.numpy())
-            m_prev = m_lam
-            P_prev = P_lam
-
-        # Assign updated particles
-        self.particles = tf.cast(x, dtype=self.dtype)
+        # Reassemble particle tensor
+        x_new = tf.stack(x_list, axis=0)
+        self.particles = tf.cast(x_new, dtype=self.dtype)
 
     def get_state_estimate(self):
         if self.particles is None:
@@ -217,7 +250,7 @@ if __name__ == "__main__":
 
     # Prior: N(0, 1)
     prior = tfd.MultivariateNormalDiag(loc=tf.zeros(d), scale_diag=tf.ones(d))
-    dhf = DaumHuangFlow(num_particles=N, state_dim=d, dtype=tf.float64)
+    dhf = LEDH(num_particles=N, state_dim=d, dtype=tf.float64)
     dhf.initialize(initial_dist=prior)
 
     # Observation model y = H x + noise
