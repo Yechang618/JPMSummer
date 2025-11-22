@@ -183,3 +183,7 @@ cython_debug/
 # Other ignores
 .vscode
 .vscode/
+
+# Back up / no use
+Not_use
+results

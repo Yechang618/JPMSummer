@@ -34,7 +34,7 @@ from src.models.PF_PF import ParticleFilterWithInvertibleFlow
 from src.models.ParticleFilter import ParticleFilter as BootstrapPF
 from src.models.KalmanFilter import KalmanFilter
 from src.models.UnscentedKalmanFilter import UnscentedKalmanFilter
-from src.models.EDH import EDH
+from models.EDH_1 import EDH
 from src.models.LEDH import LEDH
 import time
 
@@ -226,6 +226,7 @@ def experiment_linear_gaussian(T=20, seed=2):
 
     # Filters: Kalman (optimal) and PF-PF(EDH)
     A = alpha * np.eye(d)
+    
     def f_fn(x_tf: tf.Tensor) -> tf.Tensor:
         return tf.cast(alpha, tf.float64) * x_tf
 
@@ -446,6 +447,245 @@ def experiment_skewed_t_counts(T=30, seed=3):
         mse_list.append(np.mean((mean - x)**2))
 
     print("Skewed-t + count obs experiment: average MSE:", np.mean(mse_list))
+
+
+def experiment_kernel_flow_smoke(T=5, seed=123, Np=200, d=16):
+    """Small smoke experiment comparing KernelScalar and KernelMatrix flows.
+
+    Runs a simple linear-Gaussian dynamics with identity observation and
+    compares PF-PF configured with kernel-scalar (global) and kernel-matrix (local) flows.
+    """
+    rng = np.random.default_rng(seed)
+    tf.random.set_seed(seed)
+
+    # Simple dynamics: x_k = 0.9 x_{k-1} + v
+    alpha = 0.9
+    A = alpha * np.eye(d)
+    def f_fn(x_tf: tf.Tensor) -> tf.Tensor:
+        return tf.cast(alpha, tf.float64) * x_tf
+    def h_fn(x_tf: tf.Tensor) -> tf.Tensor:
+        return x_tf
+
+    # Covariances
+    Q = np.eye(d) * 0.1
+    R = np.eye(d) * 1.0
+
+    # simulate
+    xs = np.zeros((T, d))
+    zs = np.zeros((T, d))
+    xk = np.zeros(d)
+    for t in range(T):
+        v = rng.multivariate_normal(np.zeros(d), Q)
+        xk = alpha * xk + v
+        w = rng.multivariate_normal(np.zeros(d), R)
+        zs[t] = xk + w
+        xs[t] = xk
+
+    # PF-PF with kernel-scalar (global)
+    pf_kernel_scalar = ParticleFilterWithInvertibleFlow(num_particles=Np, state_dim=d, seed=11, use_local_flow=False, verbose_or_not=True, flow_type='kernel-scalar')
+    pf_kernel_scalar.initialize(mean=np.zeros(d), cov=np.eye(d)*1.0)
+
+    # PF-PF with kernel-matrix (local)
+    pf_kernel_matrix = ParticleFilterWithInvertibleFlow(num_particles=Np, state_dim=d, seed=12, use_local_flow=True, verbose_or_not=True, flow_type='kernel-matrix')
+    pf_kernel_matrix.initialize(mean=np.zeros(d), cov=np.eye(d)*1.0)
+
+    stats = {'kernel-scalar': {'mse': [], 'ess': []}, 'kernel-matrix': {'mse': [], 'ess': []}}
+
+    for t in range(T):
+        zt = zs[t]
+        # predict
+        pf_kernel_scalar.predict(dynamics_fn=f_fn, process_noise_cov=Q)
+        pf_kernel_matrix.predict(dynamics_fn=f_fn, process_noise_cov=Q)
+
+        pf_kernel_scalar.update(y=zt, H=np.eye(d), R=R)
+        pf_kernel_matrix.update(y=zt, H=np.eye(d), R=R)
+
+        m1 = np.mean(pf_kernel_scalar.particles.numpy(), axis=0)
+        m2 = np.mean(pf_kernel_matrix.particles.numpy(), axis=0)
+        stats['kernel-scalar']['mse'].append(np.mean((m1 - xs[t])**2))
+        stats['kernel-matrix']['mse'].append(np.mean((m2 - xs[t])**2))
+        stats['kernel-scalar']['ess'].append(float(pf_kernel_scalar.ess_history[-1]))
+        stats['kernel-matrix']['ess'].append(float(pf_kernel_matrix.ess_history[-1]))
+
+    print("Kernel-flow smoke experiment results:")
+    for k in stats:
+        print(f"  {k}: avg MSE={np.mean(stats[k]['mse']):.4e}, avg ESS={np.mean(stats[k]['ess']):.1f}")
+
+
+def figure2_kernel_divergence(savepath='results/figure2_kernel_divergence.png'):
+    """Reproduce Figure 2: compare divergence (repelling forces) for scalar vs matrix kernel.
+
+    Creates two scenarios: (a) similar convergence rates and (b) observed component converges faster.
+    Plots divergence vectors for scalar and matrix kernels.
+    """
+    os.makedirs(os.path.dirname(savepath), exist_ok=True)
+
+    def scalar_kernel_divergence(x_particles, x_eval, A):
+        # divergence wrt x_i: -A^T (x_i - x) K where K = exp(-0.5*(x_i-x)^T A (x_i-x))
+        diffs = x_particles - x_eval[None, :]
+        Kvals = np.exp(-0.5 * np.sum(diffs @ A * diffs, axis=1))
+        divs = - (A.T @ diffs.T).T * Kvals[:, None]
+        return divs, Kvals
+
+    def matrix_kernel_divergence(x_particles, x_eval, alpha, prior_std):
+        # per-component kernel: K^{(a)} = exp(- (x_i^a - x^a)^2 / (2 alpha sigma_a^2))
+        diffs = x_particles - x_eval[None, :]
+        sig2 = (prior_std ** 2)
+        Kcomp = np.exp(- (diffs ** 2) / (2.0 * alpha * sig2[None, :]))
+        # divergence per component: - (x_i^a - x^a)/(alpha sigma_a^2) * K^{(a)}
+        divs = - (diffs / (alpha * sig2[None, :])) * Kcomp
+        # full vector divergence is component-wise (diagonal kernel)
+        return divs, Kcomp.mean(axis=1)
+
+    # scenario settings
+    scenarios = [
+        {'name': 'similar', 'prior_std': np.array([1.0, 1.0]), 'alpha': 1.0},
+        {'name': 'observed_fast', 'prior_std': np.array([2.0, 0.2]), 'alpha': 1.0}
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+    for i, sc in enumerate(scenarios):
+        # particles arranged around two clusters
+        x_particles = np.array([[ -1.0, -0.2], [0.0, 0.0], [0.5, 1.0], [1.2, 0.8]])
+        x_eval = np.array([0.2, 0.2])
+        # scalar kernel A choose inverse prior covariance scaled
+        B = np.diag(sc['prior_std'] ** 2)
+        A = np.linalg.inv(sc['alpha'] * B)
+
+        sdiv, sK = scalar_kernel_divergence(x_particles, x_eval, A)
+        mdiv, mK = matrix_kernel_divergence(x_particles, x_eval, sc['alpha'], sc['prior_std'])
+
+        ax1 = axes[i, 0]
+        ax1.scatter(x_particles[:,0], x_particles[:,1], c='k')
+        ax1.scatter([x_eval[0]], [x_eval[1]], c='gray')
+        for p, v in zip(x_particles, sdiv):
+            ax1.arrow(p[0], p[1], v[0], v[1], head_width=0.05, color='C0')
+        ax1.set_title(f"Scalar kernel - {sc['name']}")
+
+        ax2 = axes[i, 1]
+        ax2.scatter(x_particles[:,0], x_particles[:,1], c='k')
+        ax2.scatter([x_eval[0]], [x_eval[1]], c='gray')
+        for p, v in zip(x_particles, mdiv):
+            ax2.arrow(p[0], p[1], v[0], v[1], head_width=0.05, color='C1')
+        ax2.set_title(f"Matrix kernel - {sc['name']}")
+
+    plt.tight_layout()
+    fig.savefig(savepath)
+    print(f"Saved Figure 2 reproduction to {savepath}")
+
+
+def figure3_posterior_marginals_lorenz(d=40, Np=200, obs_indices=None, savepath='results/figure3_posterior.png', seed=42, flow_kwargs=None, save_csv: bool = True):
+    """Reproduce Figure 3-like posterior marginals using Lorenz96 (small-scale).
+
+    This function simulates Lorenz96, runs one assimilation step at t=T (default T=20)
+    and applies kernel-scalar and kernel-matrix flows to compare posterior marginals
+    for two components (a chosen unobserved and observed index).
+    """
+    os.makedirs(os.path.dirname(savepath), exist_ok=True)
+    rng = np.random.default_rng(seed)
+    tf.random.set_seed(seed)
+
+    # Lorenz-96 dynamics (standard formulation)
+    def lorenz96_step(x, F=8.0, dt=0.01):
+        # dx_i/dt = (x_{i+1} - x_{i-2}) * x_{i-1} - x_i + F
+        N = len(x)
+        dx = np.zeros(N)
+        for i in range(N):
+            dx[i] = (x[(i+1)%N] - x[(i-2)%N]) * x[(i-1)%N] - x[i] + F
+        return x + dt * dx
+
+    # simulate until T steps
+    T = 20
+    x = np.zeros(d)
+    Q = np.eye(d) * 0.1
+    R = np.eye(len(obs_indices) if obs_indices is not None else d) * 1.0
+
+    # choose observation indices if not provided: observe every other variable
+    if obs_indices is None:
+        obs_indices = np.arange(0, d, 2)
+
+    # propagate to time T
+    for t in range(T):
+        x = lorenz96_step(x)
+    prior_particles = rng.multivariate_normal(x, np.eye(d)*1.0, size=Np)
+
+    # observation at T: observe obs_indices with Gaussian noise
+    y = prior_particles.mean(axis=0)[obs_indices] + rng.normal(scale=1.0, size=len(obs_indices))
+
+    # Prepare H matrix that selects observed indices
+    H = np.zeros((len(obs_indices), d))
+    for i, idx in enumerate(obs_indices):
+        H[i, idx] = 1.0
+
+    # Apply kernel-scalar and kernel-matrix flows using PF-PF wrapper
+    flow_kwargs = {} if flow_kwargs is None else dict(flow_kwargs)
+    pf_scalar = ParticleFilterWithInvertibleFlow(num_particles=Np, state_dim=d, seed=1, use_local_flow=False, flow_type='kernel-scalar', flow_kwargs=flow_kwargs)
+    pf_scalar.particles = tf.convert_to_tensor(prior_particles, dtype=tf.float64)
+    pf_scalar.log_weights = tf.fill([Np], tf.cast(tf.math.log(1.0/float(Np)), dtype=tf.float64))
+
+    pf_matrix = ParticleFilterWithInvertibleFlow(num_particles=Np, state_dim=d, seed=2, use_local_flow=True, flow_type='kernel-matrix', flow_kwargs=flow_kwargs)
+    pf_matrix.particles = tf.convert_to_tensor(prior_particles.copy(), dtype=tf.float64)
+    pf_matrix.log_weights = tf.fill([Np], tf.cast(tf.math.log(1.0/float(Np)), dtype=tf.float64))
+
+    # single update
+    pf_scalar.update(y=y, H=H, R=R)
+    pf_matrix.update(y=y, H=H, R=R)
+
+    # choose components to plot: pick one unobserved and one observed nearby
+    obs_comp = obs_indices[0]
+    unobs_comp = (obs_comp - 1) % d
+
+    prior_vals_obs = prior_particles[:, obs_comp]
+    prior_vals_unobs = prior_particles[:, unobs_comp]
+    post_scalar = pf_scalar.particles.numpy()
+    post_matrix = pf_matrix.particles.numpy()
+
+    # KDEs for prior and posterior marginals
+    kde_prior_obs = gaussian_kde(prior_vals_obs)
+    kde_prior_unobs = gaussian_kde(prior_vals_unobs)
+    kde_post_scalar_obs = gaussian_kde(post_scalar[:, obs_comp])
+    kde_post_scalar_unobs = gaussian_kde(post_scalar[:, unobs_comp])
+    kde_post_matrix_obs = gaussian_kde(post_matrix[:, obs_comp])
+    kde_post_matrix_unobs = gaussian_kde(post_matrix[:, unobs_comp])
+
+    xs = np.linspace(np.min(prior_vals_obs)-1, np.max(prior_vals_obs)+1, 200)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes[0,0].plot(xs, kde_prior_unobs(xs), label='prior')
+    axes[0,0].plot(xs, kde_post_scalar_unobs(xs), label='post scalar')
+    axes[0,0].plot(xs, kde_post_matrix_unobs(xs), label='post matrix')
+    axes[0,0].scatter(prior_vals_unobs, np.zeros_like(prior_vals_unobs), c='k', s=10)
+    axes[0,0].set_title(f'Unobserved component {unobs_comp}')
+    axes[0,0].legend()
+
+    axes[0,1].plot(xs, kde_prior_obs(xs), label='prior')
+    axes[0,1].plot(xs, kde_post_scalar_obs(xs), label='post scalar')
+    axes[0,1].plot(xs, kde_post_matrix_obs(xs), label='post matrix')
+    axes[0,1].scatter(prior_vals_obs, np.zeros_like(prior_vals_obs), c='k', s=10)
+    axes[0,1].set_title(f'Observed component {obs_comp}')
+    axes[0,1].legend()
+
+    plt.tight_layout()
+    fig.savefig(savepath)
+    print(f"Saved Figure 3 reproduction to {savepath}")
+    # Optionally save CSVs for diagnostics
+    if save_csv:
+        csv_dir = os.path.splitext(savepath)[0] + '_csv'
+        os.makedirs(csv_dir, exist_ok=True)
+        np.savetxt(os.path.join(csv_dir, 'prior_vals_obs.csv'), prior_vals_obs, delimiter=',')
+        np.savetxt(os.path.join(csv_dir, 'prior_vals_unobs.csv'), prior_vals_unobs, delimiter=',')
+        np.savetxt(os.path.join(csv_dir, 'post_scalar_obs.csv'), post_scalar[:, obs_comp], delimiter=',')
+        np.savetxt(os.path.join(csv_dir, 'post_scalar_unobs.csv'), post_scalar[:, unobs_comp], delimiter=',')
+        np.savetxt(os.path.join(csv_dir, 'post_matrix_obs.csv'), post_matrix[:, obs_comp], delimiter=',')
+        np.savetxt(os.path.join(csv_dir, 'post_matrix_unobs.csv'), post_matrix[:, unobs_comp], delimiter=',')
+        # Save kernel diagnostics if available
+        try:
+            with open(os.path.join(csv_dir, 'flow_kwargs.txt'), 'w') as fh:
+                fh.write(str(flow_kwargs))
+        except Exception:
+            pass
+        print(f"Saved diagnostic CSVs to {csv_dir}")
+    
 
 
 def experiment_linear_gaussian_part2(T=10, trials=100, Np=10000, sigma_p_list=None, sigma_z=1.0, seed=10, smoke=False):
