@@ -128,33 +128,6 @@ class SSMData:
 
         return x.stack(), y.stack()
     
-if __name__ == "__main__":
-    # Simple demo of SSMData
-    import numpy as np
-
-    T = 10
-    A = np.array([[1.0]], dtype=float)
-    H = np.array([[1.0]], dtype=float)
-    Q = np.array([[0.1]], dtype=float)
-    R = np.array([[0.5]], dtype=float)
-
-    ssm_data = SSMData(
-        transition_matrix=A,
-        observation_matrix=H,
-        transition_cov=Q,
-        observation_cov=R,
-        initial_mean=np.zeros((1,)),
-        initial_cov=np.eye(1) * 1.0,
-    )
-
-    x, y = ssm_data.sample(num_steps=T, seed=42)
-
-    print("Generated latent states (x):")
-    print(x.numpy())
-    print("Generated observations (y):")
-    print(y.numpy())
-    print("SSMData demo completed.")
-    pass
 
 def test_1d():
     try:
@@ -361,12 +334,29 @@ class StochasticVariationalData:
 
 
 if __name__ == "__main__":
-    # Run all tests
-    run_all_tests()
-    
-    # Run stochastic volatility tests
-    print("\nRunning Stochastic Volatility tests...")
-    if test_stochastic_volatility():
-        print("Stochastic Volatility tests passed.")
-    else:
-        print("Stochastic Volatility tests failed.")
+    # Simple demo of SSMData
+    import numpy as np
+
+    T = 10
+    A = np.array([[1.0]], dtype=float)
+    H = np.array([[1.0]], dtype=float)
+    Q = np.array([[0.1]], dtype=float)
+    R = np.array([[0.5]], dtype=float)
+
+    ssm_data = SSMData(
+        transition_matrix=A,
+        observation_matrix=H,
+        transition_cov=Q,
+        observation_cov=R,
+        initial_mean=np.zeros((1,)),
+        initial_cov=np.eye(1) * 1.0,
+    )
+
+    x, y = ssm_data.sample(num_steps=T, seed=42)
+
+    print("Generated latent states (x):")
+    print(x.numpy())
+    print("Generated observations (y):")
+    print(y.numpy())
+    print("SSMData demo completed.")
+    pass
