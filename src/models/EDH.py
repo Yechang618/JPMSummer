@@ -158,7 +158,8 @@ def mP_update(P_pred: tf.Tensor, m_pred: tf.Tensor, H: tf.Tensor, R: tf.Tensor, 
     m_col = m_pred_col + tf.matmul(K, innovation)
     KH = tf.matmul(K, H)
     I = tf.eye(tf.shape(P_pred)[0], dtype=dtype)
-    P = (I - KH) @ P_pred @ tf.transpose(I - KH) + KH @ R @ tf.transpose(KH)  # Joseph form
+    # Joseph form: (I-KH) P_pred (I-KH)^T + K R K^T
+    P = (I - KH) @ P_pred @ tf.transpose(I - KH) + tf.matmul(K, tf.matmul(R, tf.transpose(K)))
 
     return P, tf.reshape(m_col, [-1])
 

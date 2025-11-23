@@ -237,101 +237,13 @@ def run_all_tests():
         print("All tests passed.")
     else:
         print("Some tests failed.")
-class StochasticVolatilityData:
-    """A stochastic volatility model data generator using TensorFlow operations.
-    
-    This implements the discrete-time stochastic volatility model:
-        h_t = μ + φ(h_{t-1} - μ) + σ_η * η_t,    η_t ~ N(0, 1)
-        y_t = exp(h_t/2) * ε_t,                   ε_t ~ N(0, 1)
-        
-    where:
-    - h_t is the log-volatility at time t
-    - y_t is the observed return at time t
-    - μ is the mean log-volatility
-    - φ is the persistence parameter (mean reversion)
-    - σ_η is the volatility of log-volatility
-
-    Parameters
-    ----------
-    mu : float
-        Mean of the log-volatility process
-    phi : float
-        Persistence parameter (0 < φ < 1)
-    sigma_eta : float
-        Volatility of log-volatility
-    initial_logvol : float, optional
-        Initial log-volatility value
-    dtype : tf.DType, default tf.float64
-    """
-    def __init__(
-        self,
-        mu: float,
-        phi: float,
-        sigma_eta: float,
-        initial_logvol: Optional[float] = None,
-        dtype: tf.DType = tf.float64,
-    ) -> None:
-        self.dtype = dtype
-        self.mu = tf.convert_to_tensor(mu, dtype=self.dtype)
-        self.phi = tf.convert_to_tensor(phi, dtype=self.dtype)
-        self.sigma_eta = tf.convert_to_tensor(sigma_eta, dtype=self.dtype)
-        
-        # If initial log-volatility not provided, use stationary mean
-        if initial_logvol is None:
-            initial_logvol = mu
-        self.initial_logvol = tf.convert_to_tensor(initial_logvol, dtype=self.dtype)
-    
-    def sample(self, num_steps: int, seed: Optional[int] = None) -> Tuple[tf.Tensor, tf.Tensor]:
-        """Generate a sample sequence of log-volatilities and returns.
-        
-        Parameters
-        ----------
-        num_steps : int
-            Number of time steps to simulate
-        seed : Optional[int]
-            Random seed for reproducibility
-            
-        Returns
-        -------
-        h : tf.Tensor, shape (num_steps + 1,)
-            The generated log-volatilities
-        y : tf.Tensor, shape (num_steps,)
-            The generated returns
-        """
-        h = tf.TensorArray(dtype=self.dtype, size=num_steps + 1, clear_after_read=False)
-        y = tf.TensorArray(dtype=self.dtype, size=num_steps, clear_after_read=False)
-        
-        h = h.write(0, self.initial_logvol)
-        
-        for t in range(1, num_steps + 1):
-            if seed is not None:
-                eta = tf.cast(tfd.Normal(loc=0., scale=1.).sample(seed=seed+t), dtype=tf.float64)
-                epsilon = tf.cast(tfd.Normal(loc=0., scale=1.).sample(seed=seed+t+num_steps), dtype=tf.float64)
-            else:
-                eta = tf.cast(tfd.Normal(loc=0., scale=1.).sample(), dtype=tf.float64)
-                epsilon = tf.cast(tfd.Normal(loc=0., scale=1.).sample(), dtype=tf.float64)
-            
-            # Update log-volatility
-            h_prev = h.read(t - 1)
-            # print(self.sigma_eta)
-            # print(eta)
-            h_t = self.mu + self.phi * (h_prev - self.mu) + self.sigma_eta * eta
-            h = h.write(t, h_t)
-            
-            # Generate return
-            vol = tf.exp(h_t / 2.0)
-            y_t = vol * epsilon
-            y = y.write(t - 1, y_t)
-        
-        return h.stack(), y.stack()
 
 class StochasticVariationalData:
     """A stochastic variational model data generator supporting multivariate
 
     Model (vectorized):
         X_k = alpha * X_{k-1} + sigma * eta_k,   eta_k ~ N(0, I)
-        Z_k = beta * exp(X_k / 2) * eps_k        (elementwise)
-        Y_k = C @ Z_k                            (optional linear map to obs dim)
+        Y_k = beta * exp(X_k / 2) * eps_k        (elementwise)
 
     Parameters
     ----------
@@ -362,7 +274,6 @@ class StochasticVariationalData:
         beta,
         n_state: int = 1,
         n_obs: Optional[int] = None,
-        observation_matrix: Optional[object] = None,
         initial_state: Optional[object] = None,
         dtype: tf.DType = tf.float64,
     ) -> None:
@@ -401,16 +312,6 @@ class StochasticVariationalData:
         self.alpha = tf.convert_to_tensor(alpha_vec, dtype=self.dtype)
         self.sigma = tf.convert_to_tensor(sigma_vec, dtype=self.dtype)
         self.beta = tf.convert_to_tensor(beta_vec, dtype=self.dtype)
-
-        if observation_matrix is not None:
-            C = tf.convert_to_tensor(observation_matrix, dtype=self.dtype)
-            if C.shape[0] != self.n_obs or C.shape[1] != self.n_state:
-                raise ValueError("observation_matrix must have shape (n_obs, n_state)")
-            self.C = C
-        else:
-            self.C = None
-            if self.n_obs != self.n_state:
-                raise ValueError("n_obs must equal n_state when observation_matrix is not provided")
 
         if initial_state is None:
             init = np.zeros((self.n_state,), dtype=float)
@@ -452,52 +353,12 @@ class StochasticVariationalData:
 
             # per-state scaled volatility and multiplicative noise
             vol = self.beta * tf.exp(x_t / 2.0)
-            z = vol * eps  # shape (n_state,)
-
-            if self.C is not None:
-                y_t = tf.linalg.matvec(self.C, z)
-            else:
-                y_t = z
+            y_t = vol * eps  # shape (n_state,)
 
             y = y.write(t - 1, y_t)
 
         return x.stack(), y.stack()
 
-def test_stochastic_volatility():
-    """Test the stochastic volatility model implementation."""
-    T = 1000
-    mu = -1.0  # mean log-volatility
-    phi = 0.95  # persistence
-    sigma_eta = 0.15  # volatility of log-volatility
-    
-    sv = StochasticVolatilityData(
-        mu=mu,
-        phi=phi,
-        sigma_eta=sigma_eta,
-        initial_logvol=mu
-    )
-    
-    h, y = sv.sample(num_steps=T, seed=42)
-    h_np = h.numpy()
-    y_np = y.numpy()
-    
-    try:
-        # Basic sanity checks
-        assert not np.any(np.isnan(h_np)), "NaN values in log-volatility"
-        assert not np.any(np.isnan(y_np)), "NaN values in returns"
-        
-        # Check mean reversion
-        h_mean = np.mean(h_np)
-        assert abs(h_mean - mu) < 0.5, f"Log-volatility mean {h_mean:.3f} far from target {mu}"
-        
-        print("Stochastic Volatility Tests:")
-        print(f"- Log-volatility mean: {h_mean:.3f} (target {mu})")
-        print(f"- Return kurtosis: {scipy.stats.kurtosis(y_np):.3f}")
-        print(f"- Volatility persistence: {np.corrcoef(h_np[:-1], h_np[1:])[0,1]:.3f}")
-        return True
-    except AssertionError as e:
-        print(f"Stochastic Volatility Test FAILED: {str(e)}")
-        return False
 
 if __name__ == "__main__":
     # Run all tests
