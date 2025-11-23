@@ -226,6 +226,12 @@ class EDH:
             self.R = tf.zeros((self.observation_dim, self.observation_dim), dtype=self.dtype)
             self.R_inv = tf.zeros((self.observation_dim, self.observation_dim), dtype=self.dtype)
         
+        # Flow diagnostics: per-lambda-step magnitudes and conditioning
+        # These are lists of scalar tensors (one entry per lambda step)
+        self.flow_A_norm_history = []
+        self.flow_b_norm_history = []
+        self.flow_disp_norm_history = []
+        self.jacobian_cond_history = []
     
     def initialize(self, particles: Optional[tf.Tensor] = None, initial_dist: Optional[tfd.Distribution] = None):
         """Initialize the particle cloud. Provide either `particles` tensor or an
@@ -246,6 +252,11 @@ class EDH:
         # Clear histories
         self.mean_history = []
         self.cov_history = []
+        # Clear flow diagnostics
+        self.flow_A_norm_history = []
+        self.flow_b_norm_history = []
+        self.flow_disp_norm_history = []
+        self.jacobian_cond_history = []
 
 
     def propagate(self):
@@ -312,11 +323,36 @@ class EDH:
 
             A, b_vec, H_curr = calculate_A_b(self.h, m0, y, lam, P_pred, R, self.jitter, self.state_dim, dtype=self.dtype)
 
+            # Record per-lambda-step flow metrics computed at the linearization point
+            # Norms (Frobenius / Euclidean) of A and b
+            A_norm = tf.norm(A)
+            b_norm = tf.norm(b_vec)
+            # Jacobian of the per-step affine mapping is I + lam * A
+            J_step = tf.eye(self.state_dim, dtype=self.dtype) + lam * A
+            svals = tf.linalg.svd(J_step, compute_uv=False)
+            # condition number: max(s)/min(s) (stabilize denominator)
+            cond_eps = tf.cast(1e-12, dtype=self.dtype)
+            jac_cond = svals[0] / (svals[-1] + cond_eps)
+
+            # Snapshot particles before applying this lambda-step to compute average displacement
+            particles_before = tf.identity(self.particles)
+
             for i in range(self.num_particles):
                 xi = tf.reshape(self.particles[i], [self.state_dim])
                 dxi = tf.matmul(A, tf.reshape(xi, [-1, 1])) + tf.reshape(b_vec, [-1, 1])
                 xi = xi + lam * tf.reshape(dxi, [-1])
                 self.particles = tf.tensor_scatter_nd_update(self.particles, [[i]], [xi])
+
+            # Average displacement norm across particles for this lambda step
+            disp = self.particles - particles_before
+            per_particle_disp_norm = tf.norm(disp, axis=1)
+            avg_disp = tf.reduce_mean(per_particle_disp_norm)
+
+            # Append diagnostics (store tensors; notebook can convert to numpy later)
+            self.flow_A_norm_history.append(A_norm)
+            self.flow_b_norm_history.append(b_norm)
+            self.flow_disp_norm_history.append(avg_disp)
+            self.jacobian_cond_history.append(jac_cond)
 
             m0, _ = self._empirical_mean_and_cov(self.particles)
 
@@ -336,6 +372,71 @@ class EDH:
         self.m = x_hat
         self.P = P
         return x_hat, P        
+
+    def filter(self, observations, verbose: bool = False):
+        """Filter a sequence of observations sequentially.
+
+        For each observation y_t this method computes an approximate
+        predictive log-likelihood using a linearization at the current
+        mean, then calls `self.update(y_t)` to perform propagation and
+        the particle flow update. Returns stacked tensors of posterior
+        means, posterior covariances, and predictive log-likelihoods.
+        """
+        obs_arr = np.asarray(observations)
+        if obs_arr.ndim == 0:
+            obs_arr = np.expand_dims(obs_arr, axis=0)
+
+        T = int(obs_arr.shape[0])
+        means_list = []
+        covs_list = []
+        logliks_list = []
+
+        for t in range(T):
+            y_t = obs_arr[t]
+
+            # Predictive mean and covariance using current m,P and linearization
+            try:
+                F = lin_F(self.f, tf.reshape(self.m, [self.state_dim]), dtype=self.dtype)
+            except Exception:
+                F = tf.eye(self.state_dim, dtype=self.dtype)
+
+            P_pred, m_pred = mP_predict(F, tf.cast(self.P, dtype=self.dtype), tf.cast(self.m, dtype=self.dtype), self.Q, self.R, self.jitter, dtype=self.dtype)
+
+            # Linearize observation at predicted mean for predictive likelihood
+            try:
+                H_pred = lin_H(self.h, tf.reshape(m_pred, [self.state_dim]), dtype=self.dtype)
+            except Exception:
+                H_pred = lin_H(self.h, tf.reshape(self.m, [self.state_dim]), dtype=self.dtype)
+
+            y_loc = tf.reshape(tf.matmul(H_pred, tf.reshape(m_pred, [-1, 1])), [-1])
+            S = H_pred @ P_pred @ tf.transpose(H_pred) + tf.cast(self.R, dtype=self.dtype)
+            # stable cholesky
+            chol_S = safe_cholesky(S, base_jitter=self.jitter, dtype=self.dtype)
+            mvn = tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=chol_S)
+            y_vec = tf.convert_to_tensor(np.asarray(y_t), dtype=self.dtype)
+            try:
+                loglik = mvn.log_prob(y_vec)
+            except Exception:
+                # fallback: scalar cast
+                loglik = mvn.log_prob(tf.reshape(y_vec, [-1]))
+
+            # Run the full EDH update (propagate + flow + final Kalman update)
+            x_hat, P_post = self.update(y=y_t)
+
+            means_list.append(x_hat)
+            covs_list.append(P_post)
+            logliks_list.append(loglik)
+            if verbose:
+                try:
+                    ll_val = float(loglik)
+                except Exception:
+                    ll_val = float(loglik.numpy()) if hasattr(loglik, 'numpy') else loglik
+                print(f"EDH.filter t={t+1} mean={np.round(x_hat.numpy(),3)} loglik={ll_val}")
+
+        means = tf.stack(means_list, axis=0)
+        covs = tf.stack(covs_list, axis=0)
+        logliks = tf.stack(logliks_list, axis=0)
+        return means, covs, logliks
 
 
     def get_state_estimate(self):
@@ -511,7 +612,69 @@ class LEDH:
         self.m = x_hat
         self.P = P
         return x_hat, P
+    
+    def filter(self, observations, verbose: bool = False):
+        """Filter a sequence of observations sequentially (LEDH version).
 
+        For each observation y_t this method computes an approximate
+        predictive log-likelihood using a linearization at the current
+        mean, then calls `self.update(y_t)` to perform propagation and
+        the local particle flow update. Returns stacked tensors of posterior
+        means, posterior covariances, and predictive log-likelihoods.
+        """
+        obs_arr = np.asarray(observations)
+        if obs_arr.ndim == 0:
+            obs_arr = np.expand_dims(obs_arr, axis=0)
+
+        T = int(obs_arr.shape[0])
+        means_list = []
+        covs_list = []
+        logliks_list = []
+
+        for t in range(T):
+            y_t = obs_arr[t]
+
+            # Predictive mean and covariance using current m,P and linearization
+            try:
+                F = lin_F(self.f, tf.reshape(self.m, [self.state_dim]), dtype=self.dtype)
+            except Exception:
+                F = tf.eye(self.state_dim, dtype=self.dtype)
+
+            P_pred, m_pred = mP_predict(F, tf.cast(self.P, dtype=self.dtype), tf.cast(self.m, dtype=self.dtype), self.Q, self.R, self.jitter, dtype=self.dtype)
+
+            # Linearize observation at predicted mean for predictive likelihood
+            try:
+                H_pred = lin_H(self.h, tf.reshape(m_pred, [self.state_dim]), dtype=self.dtype)
+            except Exception:
+                H_pred = lin_H(self.h, tf.reshape(self.m, [self.state_dim]), dtype=self.dtype)
+
+            y_loc = tf.reshape(tf.matmul(H_pred, tf.reshape(m_pred, [-1, 1])), [-1])
+            S = H_pred @ P_pred @ tf.transpose(H_pred) + tf.cast(self.R, dtype=self.dtype)
+            chol_S = safe_cholesky(S, base_jitter=self.jitter, dtype=self.dtype)
+            mvn = tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=chol_S)
+            y_vec = tf.convert_to_tensor(np.asarray(y_t), dtype=self.dtype)
+            try:
+                loglik = mvn.log_prob(y_vec)
+            except Exception:
+                loglik = mvn.log_prob(tf.reshape(y_vec, [-1]))
+
+            # Run the LEDH update
+            x_hat, P_post = self.update(y=y_t)
+
+            means_list.append(x_hat)
+            covs_list.append(P_post)
+            logliks_list.append(loglik)
+            if verbose:
+                try:
+                    ll_val = float(loglik)
+                except Exception:
+                    ll_val = float(loglik.numpy()) if hasattr(loglik, 'numpy') else loglik
+                print(f"LEDH.filter t={t+1} mean={np.round(x_hat.numpy(),3)} loglik={ll_val}")
+
+        means = tf.stack(means_list, axis=0)
+        covs = tf.stack(covs_list, axis=0)
+        logliks = tf.stack(logliks_list, axis=0)
+        return means, covs, logliks
 
     def get_state_estimate(self):
         if self.particles is None:

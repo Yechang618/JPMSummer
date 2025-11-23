@@ -108,13 +108,16 @@ class UnscentedKalmanFilter:
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
         self.verbose = bool(verbose_or_not)
+        # Evaluation histories
+        self.rmse_history = []
+        self.ll_history = []
 
     def reset(self) -> None:
         """Reset the internal filter state to the initial mean/covariance."""
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
 
-    def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    def step(self, observation, true_state=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Perform a single predict-update step (stateful) and return posterior.
 
         Parameters
@@ -186,6 +189,27 @@ class UnscentedKalmanFilter:
         mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
         loglik = mvn.log_prob(y)
 
+        # Record per-step diagnostics
+        try:
+            self.ll_history.append(float(loglik.numpy()))
+        except Exception:
+            try:
+                self.ll_history.append(float(loglik))
+            except Exception:
+                self.ll_history.append(None)
+
+        if true_state is not None:
+            try:
+                true_t = tf.convert_to_tensor(true_state, dtype=self.dtype)
+                diff = tf.reshape(self.m - true_t, [-1])
+                rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+                try:
+                    self.rmse_history.append(float(rmse.numpy()))
+                except Exception:
+                    self.rmse_history.append(float(rmse))
+            except Exception:
+                self.rmse_history.append(None)
+
         return self.m, self.P, loglik
 
     def _calculate_weights(self) -> None:
@@ -247,7 +271,7 @@ class UnscentedKalmanFilter:
 
         return tf.stack(sigmas, axis=0)
 
-    def filter(self, observations) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    def filter(self, observations, true_states=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Run the Unscented Kalman Filter on observations.
 
         Parameters
@@ -273,6 +297,16 @@ class UnscentedKalmanFilter:
         filtered_covs = tf.TensorArray(dtype=self.dtype, size=T)
         total_loglik = tf.constant(0.0, dtype=self.dtype)
         
+        # Optional true states tensor for RMSE computation
+        true_states_tensor = None
+        if true_states is not None:
+            try:
+                true_states_tensor = tf.convert_to_tensor(true_states, dtype=self.dtype)
+                if true_states_tensor.shape.rank == 1:
+                    true_states_tensor = tf.reshape(true_states_tensor, (-1, 1))
+            except Exception:
+                true_states_tensor = None
+
         for t in tf.range(T):
             # Get observation
             y = obs_arr[t]
@@ -324,7 +358,29 @@ class UnscentedKalmanFilter:
             
             # Log-likelihood
             mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
-            total_loglik += mvn.log_prob(y)
+            loglik = mvn.log_prob(y)
+            total_loglik += loglik
+
+            # Record per-step diagnostics
+            try:
+                self.ll_history.append(float(loglik.numpy()))
+            except Exception:
+                try:
+                    self.ll_history.append(float(loglik))
+                except Exception:
+                    self.ll_history.append(None)
+
+            if true_states_tensor is not None:
+                try:
+                    true_t = true_states_tensor[t]
+                    diff = tf.reshape(m - tf.convert_to_tensor(true_t, dtype=self.dtype), [-1])
+                    rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+                    try:
+                        self.rmse_history.append(float(rmse.numpy()))
+                    except Exception:
+                        self.rmse_history.append(float(rmse))
+                except Exception:
+                    self.rmse_history.append(None)
             
             filtered_means = filtered_means.write(t, m)
             filtered_covs = filtered_covs.write(t, P)

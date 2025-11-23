@@ -121,6 +121,11 @@ class ParticleFilter:
         self.last_weights = None
         self.ess_history = []
         self.weights_history = []
+        # Evaluation histories
+        # Per-step RMSE of particle mean vs true state (if provided)
+        self.rmse_history = []
+        # Per-step observation log-likelihoods (float list)
+        self.ll_history = []
 
     def __getattr__(self, name: str):
         """Lazily create and return diagnostic attributes if missing.
@@ -268,16 +273,101 @@ class ParticleFilter:
             print("ParticleFilter: estimate() returning mean and covariance")
         return mean, cov
 
-    def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        """Perform a predict-update cycle and return estimate and loglik."""
+    def step(self, observation, true_state=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Perform a predict-update cycle and return estimate and loglik.
+
+        Parameters
+        ----------
+        observation : array-like
+            Observation for current time step
+        true_state : array-like or tf.Tensor, optional
+            True state at this time step for RMSE calculation. If not provided,
+            RMSE will not be recorded for this step.
+        """
         if self.verbose:
             print("ParticleFilter: step() starting predict-update cycle")
         self.predict()
         loglik = self.update(observation)
         mean, cov = self.estimate()
+
+        # Record per-step log-likelihood
+        try:
+            self.ll_history.append(float(loglik.numpy()))
+        except Exception:
+            try:
+                self.ll_history.append(float(loglik))
+            except Exception:
+                self.ll_history.append(None)
+
+        # RMSE if true state provided
+        if true_state is not None:
+            try:
+                true_t = tf.convert_to_tensor(true_state, dtype=self.dtype)
+                diff = tf.reshape(mean - true_t, [-1])
+                rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+                try:
+                    self.rmse_history.append(float(rmse.numpy()))
+                except Exception:
+                    self.rmse_history.append(float(rmse))
+            except Exception:
+                self.rmse_history.append(None)
+
         if self.verbose:
             print("ParticleFilter: step() finished")
         return mean, cov, loglik
+
+    def filter(self, observations, true_states=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        """Filter a sequence of observations.
+
+        Runs sequential predict-update cycles over `observations` by calling
+        `self.step` for each observation. Returns stacked tensors of
+        means, covariances and log-likelihoods for each time step.
+
+        Parameters
+        ----------
+        observations : array-like or tf.Tensor
+            Sequence of observations. Can be a 1D array-like for scalar
+            observations (obs_dim == 1) or shape (T, obs_dim).
+
+        Returns
+        -------
+        means : tf.Tensor, shape (T, state_dim)
+        covs : tf.Tensor, shape (T, state_dim, state_dim)
+        logliks : tf.Tensor, shape (T,)
+        """
+        # Convert to numpy array for simple iteration (keeps API flexible)
+        obs_arr = np.asarray(observations)
+
+        # Handle scalar-observation case: ensure first axis is time
+        if obs_arr.ndim == 0:
+            obs_arr = np.expand_dims(obs_arr, axis=0)
+
+        T = int(obs_arr.shape[0])
+
+        means_list = []
+        covs_list = []
+        logliks_list = []
+
+        for t in range(T):
+            y_t = obs_arr[t]
+            if true_states is not None:
+                try:
+                    true_t = true_states[t]
+                except Exception:
+                    true_t = None
+                mean, cov, ll = self.step(y_t, true_state=true_t)
+            else:
+                mean, cov, ll = self.step(y_t)
+            means_list.append(mean)
+            covs_list.append(cov)
+            logliks_list.append(ll)
+
+        # Stack results along time axis
+        means = tf.stack(means_list, axis=0)
+        covs = tf.stack(covs_list, axis=0)
+        logliks = tf.stack(logliks_list, axis=0)
+
+        return means, covs, logliks
 
 
 if __name__ == "__main__":

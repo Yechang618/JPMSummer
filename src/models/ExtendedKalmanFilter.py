@@ -70,13 +70,18 @@ class ExtendedKalmanFilter:
         # initialize running state for step() convenience (keeps filter stateful)
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
+        # Evaluation histories
+        # Per-step RMSE of state estimate (float list). Appended if true states provided.
+        self.rmse_history = []
+        # Per-step observation log-likelihood (float list)
+        self.ll_history = []
 
     def reset(self) -> None:
         """Reset the internal filter state to the initial mean/covariance."""
         self.m = tf.identity(self.m0)
         self.P = tf.identity(self.P0)
 
-    def step(self, observation) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    def step(self, observation, true_state=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Perform a single predict-update step and update internal state.
 
         Parameters
@@ -132,6 +137,28 @@ class ExtendedKalmanFilter:
         mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
         loglik = mvn.log_prob(y)
 
+        # Record per-step diagnostics (if possible)
+        try:
+            self.ll_history.append(float(loglik.numpy()))
+        except Exception:
+            try:
+                self.ll_history.append(float(loglik))
+            except Exception:
+                self.ll_history.append(None)
+
+        # RMSE against provided true state (if given)
+        if true_state is not None:
+            try:
+                true_t = tf.convert_to_tensor(true_state, dtype=self.dtype)
+                diff = tf.reshape(self.m - true_t, [-1])
+                rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+                try:
+                    self.rmse_history.append(float(rmse.numpy()))
+                except Exception:
+                    self.rmse_history.append(float(rmse))
+            except Exception:
+                self.rmse_history.append(None)
+
         return self.m, self.P, loglik
 
     def _jacobian(self, func: Callable[[tf.Tensor], tf.Tensor], x: tf.Tensor) -> tf.Tensor:
@@ -148,7 +175,7 @@ class ExtendedKalmanFilter:
         J = tf.reshape(J, (tf.shape(y)[0], tf.shape(x)[0]))
         return J
 
-    def filter(self, observations) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    def filter(self, observations, true_states=None) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Run the Extended Kalman Filter on observations.
 
         Parameters
@@ -167,6 +194,17 @@ class ExtendedKalmanFilter:
             obs_arr = tf.reshape(obs_arr, (-1, 1))
 
         T = tf.shape(obs_arr)[0]
+
+        # Optional true states for RMSE computation. Accepts array-like of shape (T, state_dim) or (T,)
+        true_states_tensor = None
+        if true_states is not None:
+            try:
+                true_states_tensor = tf.convert_to_tensor(true_states, dtype=self.dtype)
+                if true_states_tensor.shape.rank == 1:
+                    # reshape to (T, state_dim=1)
+                    true_states_tensor = tf.reshape(true_states_tensor, (-1, 1))
+            except Exception:
+                true_states_tensor = None
 
         m = tf.identity(self.m0)
         P = tf.identity(self.P0)
@@ -205,7 +243,30 @@ class ExtendedKalmanFilter:
 
             # Log-likelihood
             mvn = tfd.MultivariateNormalFullCovariance(loc=y_pred, covariance_matrix=S)
-            total_loglik += mvn.log_prob(y)
+            loglik = mvn.log_prob(y)
+            total_loglik += loglik
+
+            # Record per-step diagnostics
+            try:
+                self.ll_history.append(float(loglik.numpy()))
+            except Exception:
+                try:
+                    self.ll_history.append(float(loglik))
+                except Exception:
+                    self.ll_history.append(None)
+
+            # RMSE if true states provided
+            if true_states_tensor is not None:
+                try:
+                    true_t = true_states_tensor[t]
+                    diff = tf.reshape(m - tf.convert_to_tensor(true_t, dtype=self.dtype), [-1])
+                    rmse = tf.sqrt(tf.reduce_mean(tf.square(diff)))
+                    try:
+                        self.rmse_history.append(float(rmse.numpy()))
+                    except Exception:
+                        self.rmse_history.append(float(rmse))
+                except Exception:
+                    self.rmse_history.append(None)
 
             filtered_means = filtered_means.write(t, m)
             filtered_covs = filtered_covs.write(t, P)

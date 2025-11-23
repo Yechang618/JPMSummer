@@ -59,6 +59,11 @@ class BaseParticleFlowPF:
         # Flow integration settings
         self.n_flow_steps = 10
         self.jitter = 1e-6
+        # Flow diagnostics (per-lambda-step aggregated)
+        self.flow_A_norm_history = []
+        self.flow_b_norm_history = []
+        self.flow_disp_norm_history = []
+        self.jacobian_cond_history = []
 
     def initialize(self, particles: Optional[tf.Tensor] = None, initial_dist: Optional[tfd.Distribution] = None):
         if particles is None and initial_dist is None:
@@ -78,6 +83,11 @@ class BaseParticleFlowPF:
         self.P = cov
         # default per-particle covariances: copy global cov
         self.P_particles = tf.tile(tf.expand_dims(cov, 0), [self.num_particles, 1, 1])
+        # Clear diagnostics
+        self.flow_A_norm_history = []
+        self.flow_b_norm_history = []
+        self.flow_disp_norm_history = []
+        self.jacobian_cond_history = []
 
     def _empirical_mean_and_cov(self, weights: Optional[tf.Tensor], particles: tf.Tensor):
         """Compute empirical (possibly weighted) mean and covariance.
@@ -175,6 +185,16 @@ class EDH_ParticleFlowPF(BaseParticleFlowPF):
             lam = tf.cast(lam, dtype=self.dtype)
             A, b_vec, H_curr = calculate_A_b(self.h, bar_eta, z, lam, P_pred, self.R, self.jitter, d, dtype=self.dtype)
             step = tf.cast(1.0 / float(self.n_flow_steps), dtype=self.dtype)
+            # Diagnostics: norms and Jacobian conditioning for this lambda-step
+            A_norm = tf.norm(A)
+            b_norm = tf.norm(b_vec)
+            I = tf.eye(d, dtype=self.dtype)
+            mat = I + step * A
+            svals = tf.linalg.svd(mat, compute_uv=False)
+            cond_eps = tf.cast(1e-12, dtype=self.dtype)
+            jac_cond = svals[0] / (svals[-1] + cond_eps)
+            # snapshot eta1 before particle updates to compute average displacement
+            eta_before = tf.identity(eta1)
             # (clean) shapes are expected: A [d,d], bar_eta [d], b_vec [d]
             # update bar_eta as column vector to avoid broadcasting to 2-D
             bar_col = tf.reshape(bar_eta, [d, 1])
@@ -192,6 +212,14 @@ class EDH_ParticleFlowPF(BaseParticleFlowPF):
             mat = I + step * A
             sign, logabsdet = tf.linalg.slogdet(mat)
             log_theta += float(logabsdet.numpy())
+
+            # average displacement across particles for this lambda step
+            disp = eta1 - eta_before
+            avg_disp = tf.reduce_mean(tf.norm(disp, axis=1))
+            self.flow_A_norm_history.append(A_norm)
+            self.flow_b_norm_history.append(b_norm)
+            self.flow_disp_norm_history.append(avg_disp)
+            self.jacobian_cond_history.append(jac_cond)
 
         # set particles to final eta1
         self.particles = tf.cast(eta1, dtype=self.dtype)
@@ -233,6 +261,61 @@ class EDH_ParticleFlowPF(BaseParticleFlowPF):
                 self.resample()
 
         return x_hat, cov
+    def filter(self, observations, resample_threshold: Optional[float] = None, verbose: bool = False):
+        """Run sequential filtering over `observations` using `step`.
+
+        Args:
+            observations: array-like or tf.Tensor with shape (T, observation_dim)
+            resample_threshold: optional ESS threshold to trigger resampling each step
+
+        Returns:
+            means_tf: tf.Tensor shape (T, state_dim)
+            covs_tf: tf.Tensor shape (T, state_dim, state_dim)
+            ll_tf: tf.Tensor shape (T,) approximate log-likelihoods per step
+        """
+        obs_arr = np.asarray(observations)
+        means = []
+        covs = []
+        lls = []
+
+        # small epsilon to avoid log(0)
+        eps = 1e-300
+
+        for idx, y in enumerate(obs_arr, start=1):
+            y_t = tf.convert_to_tensor(y, dtype=self.dtype)
+            x_hat, cov = self.step(y_t, resample_threshold=resample_threshold)
+            means.append(x_hat.numpy())
+            covs.append(cov.numpy())
+
+            # approximate marginal log-likelihood via weighted particle likelihoods
+            # build observation distribution
+            obs_tril = tf.linalg.cholesky(self.R + tf.eye(self.observation_dim, dtype=self.dtype) * 1e-12)
+            obs_dist = tfd.MultivariateNormalTriL(loc=tf.zeros(self.observation_dim, dtype=self.dtype),
+                                                  scale_tril=obs_tril)
+            # per-particle log probs
+            logps = []
+            for i in range(self.num_particles):
+                hz = tf.reshape(self.h(tf.reshape(self.particles[i], [self.state_dim])), [-1])
+                lp = obs_dist.log_prob(tf.reshape(y_t - hz, [-1]))
+                logps.append(float(lp.numpy()))
+            logps_tf = tf.constant(np.asarray(logps), dtype=self.dtype)
+            logw_tf = tf.math.log(self.weights + tf.cast(eps, self.dtype))
+            loglik_tf = tf.reduce_logsumexp(logw_tf + logps_tf)
+            ll_val = float(loglik_tf.numpy())
+            lls.append(ll_val)
+            if verbose:
+                try:
+                    ess = float(self.effective_N())
+                except Exception:
+                    ess = None
+                print(f"EDH_ParticleFlowPF.filter step={idx} mean={np.round(x_hat.numpy(),3)} loglik={ll_val} ESS={ess}")
+
+        means_tf = tf.convert_to_tensor(np.vstack(means), dtype=self.dtype)
+        covs_tf = tf.convert_to_tensor(np.stack(covs), dtype=self.dtype)
+        ll_tf = tf.convert_to_tensor(np.asarray(lls), dtype=self.dtype)
+        return means_tf, covs_tf, ll_tf    
+
+
 
 
 class LEDH_ParticleFlowPF(BaseParticleFlowPF):
@@ -292,16 +375,27 @@ class LEDH_ParticleFlowPF(BaseParticleFlowPF):
             lam = tf.cast(lam, dtype=self.dtype)
             # eps = lam - 0.0 if False else (1.0 / (self.n_flow_steps))  # small step size (approximate)
             # The code uses lam itself when building A/b (as in EDH.calculate_A_b)
+            # Prepare accumulators for per-particle diagnostics this lambda step
+            A_norms = []
+            b_norms = []
+            jac_conds = []
+            eta_before = tf.stack(eta1)
             for i in range(N):
                 m0_i = bar_eta[i]
                 P_pred_i = P_preds[i]
                 # compute A,b at this lam for this particle
                 A_i, b_i, H_curr = calculate_A_b(self.h, m0_i, z, lam, P_pred_i, self.R, self.jitter, d, dtype=self.dtype)
-                # update bar_eta and eta1 using Euler-like step with step size 1/n_flow_steps
+                # record per-particle A/b norms and jacobian cond
+                A_norms.append(tf.norm(A_i))
+                b_norms.append(tf.norm(b_i))
+                I = tf.eye(d, dtype=self.dtype)
                 step = tf.cast(1.0 / float(self.n_flow_steps), dtype=self.dtype)
+                mat = I + step * A_i
+                svals = tf.linalg.svd(mat, compute_uv=False)
+                cond_eps = tf.cast(1e-12, dtype=self.dtype)
+                jac_conds.append(svals[0] / (svals[-1] + cond_eps))
+                # update bar_eta and eta1 using Euler-like step with step size 1/n_flow_steps
                 # Coerce vectors to length d in case of unexpected shapes
-                # bar_vec = tf.reshape(bar_eta[i], [-1])[:d]
-                # eta_vec = tf.reshape(eta1[i], [-1])[:d]
                 bar_vec = tf.reshape(bar_eta[i], [-1])
                 eta_vec = tf.reshape(eta1[i], [-1])
                 bar_update = step * (tf.matmul(A_i, tf.reshape(bar_vec, [-1, 1])) + tf.reshape(b_i, [-1, 1]))
@@ -309,11 +403,21 @@ class LEDH_ParticleFlowPF(BaseParticleFlowPF):
                 bar_eta[i] = tf.reshape(bar_vec + tf.reshape(bar_update, [-1]), [d])
                 eta1[i] = tf.reshape(eta_vec + tf.reshape(eta_update, [-1]), [d])
                 # update log_theta by adding log|det(I + step * A)|
-                I = tf.eye(d, dtype=self.dtype)
                 mat = I + step * A_i
                 sign, logabsdet = tf.linalg.slogdet(mat)
                 # convert to numpy float and accumulate
                 log_theta[i] += float(logabsdet.numpy())
+            # after updating all particles, aggregate diagnostics for this lambda
+            avg_A_norm = tf.reduce_mean(tf.stack(A_norms))
+            avg_b_norm = tf.reduce_mean(tf.stack(b_norms))
+            avg_jac = tf.reduce_mean(tf.stack(jac_conds))
+            eta_after = tf.stack(eta1)
+            disp = eta_after - eta_before
+            avg_disp = tf.reduce_mean(tf.norm(disp, axis=1))
+            self.flow_A_norm_history.append(avg_A_norm)
+            self.flow_b_norm_history.append(avg_b_norm)
+            self.flow_disp_norm_history.append(avg_disp)
+            self.jacobian_cond_history.append(avg_jac)
 
         # Convert lists to tensors
         eta1 = tf.stack(eta1)
@@ -386,6 +490,59 @@ class LEDH_ParticleFlowPF(BaseParticleFlowPF):
                 self.resample()
 
         return x_hat, cov
+    def filter(self, observations, resample_threshold: Optional[float] = None, verbose: bool = False):
+        """Run sequential filtering over `observations` using `step`.
+
+        Args:
+            observations: array-like or tf.Tensor with shape (T, observation_dim)
+            resample_threshold: optional ESS threshold to trigger resampling each step
+
+        Returns:
+            means_tf: tf.Tensor shape (T, state_dim)
+            covs_tf: tf.Tensor shape (T, state_dim, state_dim)
+            ll_tf: tf.Tensor shape (T,) approximate log-likelihoods per step
+        """
+        obs_arr = np.asarray(observations)
+        means = []
+        covs = []
+        lls = []
+
+        # small epsilon to avoid log(0)
+        eps = 1e-300
+
+        for idx, y in enumerate(obs_arr, start=1):
+            y_t = tf.convert_to_tensor(y, dtype=self.dtype)
+            x_hat, cov = self.step(y_t, resample_threshold=resample_threshold)
+            means.append(x_hat.numpy())
+            covs.append(cov.numpy())
+
+            # approximate marginal log-likelihood via weighted particle likelihoods
+            # build observation distribution
+            obs_tril = tf.linalg.cholesky(self.R + tf.eye(self.observation_dim, dtype=self.dtype) * 1e-12)
+            obs_dist = tfd.MultivariateNormalTriL(loc=tf.zeros(self.observation_dim, dtype=self.dtype),
+                                                  scale_tril=obs_tril)
+            # per-particle log probs
+            logps = []
+            for i in range(self.num_particles):
+                hz = tf.reshape(self.h(tf.reshape(self.particles[i], [self.state_dim])), [-1])
+                lp = obs_dist.log_prob(tf.reshape(y_t - hz, [-1]))
+                logps.append(float(lp.numpy()))
+            logps_tf = tf.constant(np.asarray(logps), dtype=self.dtype)
+            logw_tf = tf.math.log(self.weights + tf.cast(eps, self.dtype))
+            loglik_tf = tf.reduce_logsumexp(logw_tf + logps_tf)
+            ll_val = float(loglik_tf.numpy())
+            lls.append(ll_val)
+            if verbose:
+                try:
+                    ess = float(self.effective_N())
+                except Exception:
+                    ess = None
+                print(f"LEDH_ParticleFlowPF.filter step={idx} mean={np.round(x_hat.numpy(),3)} loglik={ll_val} ESS={ess}")
+
+        means_tf = tf.convert_to_tensor(np.vstack(means), dtype=self.dtype)
+        covs_tf = tf.convert_to_tensor(np.stack(covs), dtype=self.dtype)
+        ll_tf = tf.convert_to_tensor(np.asarray(lls), dtype=self.dtype)
+        return means_tf, covs_tf, ll_tf    
 
 
 
@@ -424,8 +581,22 @@ if __name__ == "__main__":
         prior = tfd.MultivariateNormalDiag(loc=tf.zeros(d, dtype=tf.float64), scale_diag=tf.ones(d, dtype=tf.float64))
         particles = prior.sample(N)
 
-        pf_ledh = LEDH_ParticleFlowPF(num_particles=N, f=(lambda x: x), h=h_fn, state_dim=d, observation_dim=d, R=R, Q=Q, dtype=tf.float64)
-        pf_edh = EDH_ParticleFlowPF(num_particles=N, f=(lambda x: x), h=h_fn, state_dim=d, observation_dim=d, R=R, Q=Q, dtype=tf.float64)
+        pf_ledh = LEDH_ParticleFlowPF(num_particles=N, 
+                                      f=(lambda x: x), 
+                                      h=h_fn, 
+                                      state_dim=d, 
+                                      observation_dim=d, 
+                                      R=R, 
+                                      Q=Q, 
+                                      dtype=tf.float64)
+        pf_edh = EDH_ParticleFlowPF(num_particles=N, 
+                                    f=(lambda x: x), 
+                                    h=h_fn, 
+                                    state_dim=d, 
+                                    observation_dim=d, 
+                                    R=R, 
+                                    Q=Q, 
+                                    dtype=tf.float64)
 
         pf_ledh.initialize(particles=particles)
         pf_edh.initialize(particles=particles)
@@ -437,31 +608,41 @@ if __name__ == "__main__":
         true_x = tf.zeros(d, dtype=tf.float64)
 
         print("Running PFPF self-test T=", T)
-        for t in range(T):
-            # process noise: draw 1xd standard normal, multiply by Cholesky to get 1xd, then reshape
+
+        # Generate true states and observations up-front
+        true_states = []
+        observations = []
+        x_t = tf.zeros(d, dtype=tf.float64)
+        for _ in range(T):
             proc_noise = tf.reshape(tf.matmul(tf.random.normal([1, d], dtype=tf.float64), tf.linalg.cholesky(Q)), [-1])
-            true_x = true_x + proc_noise
-            # observation with noise
+            x_t = x_t + proc_noise
             obs_noise = tf.reshape(tf.matmul(tf.random.normal([1, d], dtype=tf.float64), tf.linalg.cholesky(R)), [-1])
-            y_t = tf.reshape(tf.matmul(H, tf.reshape(true_x, [-1, 1])), [-1]) + obs_noise
+            y_t = tf.reshape(tf.matmul(H, tf.reshape(x_t, [-1, 1])), [-1]) + obs_noise
+            true_states.append(x_t)
+            observations.append(y_t)
 
-            ledh_hat, ledh_P = pf_ledh.step(y_t)
-            edh_hat, edh_P = pf_edh.step(y_t)
+        true_states = tf.stack(true_states)  # shape (T, d)
+        obs_all = tf.stack(observations)     # shape (T, d)
 
-            print(f"t={t+1}  y={np.round(y_t.numpy(),3)}, x = {np.round(true_x.numpy(),3)}")
-            print("  LEDH mean:", np.round(ledh_hat.numpy(),3), "EDH mean:", np.round(edh_hat.numpy(),3))
+        # Run filters using the new `filter` methods (pass numpy arrays or tensors)
+        ledh_means_tf, ledh_covs_tf, ledh_ll = pf_ledh.filter(obs_all.numpy())
+        edh_means_tf, edh_covs_tf, edh_ll = pf_edh.filter(obs_all.numpy())
 
-        ledh_mean = ledh_hat.numpy()
-        edh_mean = edh_hat.numpy()
-        ledh_cov = ledh_P.numpy()
-        edh_cov = edh_P.numpy()
+        # Final estimates (last time step)
+        ledh_mean = ledh_means_tf[-1].numpy()
+        edh_mean = edh_means_tf[-1].numpy()
+        ledh_cov = ledh_covs_tf[-1].numpy()
+        edh_cov = edh_covs_tf[-1].numpy()
+
+        print("Final true x:", np.round(true_states[-1].numpy(), 3))
+        print("  LEDH mean:", np.round(ledh_mean, 3), "EDH mean:", np.round(edh_mean, 3))
 
         ok_mean = np.allclose(ledh_mean, edh_mean, atol=1e-1, rtol=1e-6)
         ok_cov = np.allclose(ledh_cov, edh_cov, atol=1e-1, rtol=1e-6)
 
         if ok_mean and ok_cov:
-                print("PFPF SELF-TEST: PASS — LEDH and EDH particle-flow PFs produce similar final estimates")
-                sys.exit(0)
+            print("PFPF SELF-TEST: PASS — LEDH and EDH particle-flow PFs produce similar final estimates")
+            sys.exit(0)
         else:
-                print("PFPF SELF-TEST: FAIL — outputs differ")
-                sys.exit(2)
+            print("PFPF SELF-TEST: FAIL — outputs differ")
+            sys.exit(2)

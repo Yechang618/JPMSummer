@@ -34,8 +34,8 @@ from src.models.PF_PF import ParticleFilterWithInvertibleFlow
 from src.models.ParticleFilter import ParticleFilter as BootstrapPF
 from src.models.KalmanFilter import KalmanFilter
 from src.models.UnscentedKalmanFilter import UnscentedKalmanFilter
-from models.EDH_1 import EDH
-from src.models.LEDH import LEDH
+from src.models.EDH_1 import EDH
+from src.models.EDH import LEDH
 import time
 
 

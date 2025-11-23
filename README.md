@@ -1,115 +1,98 @@
-# JPM Project
+JPMSummer — Particle flow & Kalman filter experiments
+=====================================================
 
-This project implements a Kalman filter using TensorFlow and TensorFlow Probability, designed for financial time series analysis.
+**Project**
+- **Summary:**: JPMSummer contains experimental implementations of Kalman filters and particle-based filters, including particle-flow filters (EDH/LEDH), kernelized particle flows (scalar & matrix kernel variants), and particle filters. It also includes data generators and notebooks for running and visualizing experiments.
+- **Purpose:**: Research and teaching experiments for sequential Bayesian filtering, particle flows, and kernel flows. Useful as a reference and starting point for algorithm exploration and comparison.
 
-## Features
-
- - Extended (nonlinear) Kalman filter implemented with TensorFlow + TensorFlow Probability (EKF)
- - A lightweight NumPy-based EKF demo helper is also included for quick experiments
-
-## Installation
-Create a simple 1D Kalman filter
-### Prerequisites
-
-```bash
-# Run all tests (requires tensorflow and tensorflow-probability installed)
-pytest
-
-# Run specific test file
-pytest test/test_kalman.py
-pytest test/test_extended_kalman.py
-
-# Run standalone tests (if provided)
-python scripts/run_kalman_tests.py
-```
-
-Note: the Extended Kalman Filter test uses TensorFlow; install dev extras
-to get pytest and other development tools:
-
-# JPM Project
-
-This project implements Kalman filtering tools using TensorFlow and TensorFlow Probability, primarily focused on time-series (financial) applications. It includes both a linear Kalman Filter and an Extended Kalman Filter (EKF) that uses automatic differentiation for Jacobians.
-
-## Features
-
-- Linear Kalman filter implementation with TensorFlow backend
-- Extended (nonlinear) Kalman filter implemented with TensorFlow + TensorFlow Probability (EKF)
-- A lightweight NumPy-based EKF demo helper is included for quick experiments and tests
-- Support for 1D and multi-dimensional state spaces
-- Log-likelihood computation for model comparison and diagnostics
-- Example notebook for stock data analysis
- - Particle Filter (PF) implementation with diagnostics:
-     - Tracks effective sample size (ESS) and normalized particle weights per step
-     - Provides `last_ess`, `ess_history` and `weights_history` attributes for plotting degeneracy
-     - See `kalman_filter_demo.ipynb` for an ESS visualization and particle-count sweep example
-
-## Installation
-
-### Prerequisites
-# JPMSummer
-
-This repository contains implementations of Kalman filters and particle filters, plus experiment scripts comparing methods (Kalman Filter, UKF, Bootstrap PF, PF-PF with Daum–Huang flows, EDH, LEDH).
+**Repository Structure**
+- **Root files:**: `pyproject.toml`, `setup.py`, `test-requirements.txt`, `LICENSE`, `README.md`, and example notebooks (`experiments_part_1.ipynb`, `kalman_filter_demo.ipynb`).
+- **Source:**: `src/` contains the core code:
+  - `src/models/` — implementations of `KalmanFilter`, `ExtendedKalmanFilter`, `UnscentedKalmanFilter`, `ParticleFilter`, `ParticleFlow` variants (`PFPF.py`, `EDH.py`, `LEDH.py`), and `KernelFlow.py` (kernelized flows).
+  - `src/data/` — data generators and helper functions (e.g., `StochasticVariationalData`).
+  - `src/tf_keras/` — small TF/Keras helper wrappers used by demos.
+- **Tests & Demos:**: `test/` contains unit tests and `experiments_part_1.ipynb` contains an interactive demo and experiments.
 
 **Features**
-- **Kalman & EKF**: Linear Kalman filter and Extended Kalman Filter (EKF) implemented with TensorFlow and automatic differentiation.
-- **Unscented Kalman Filter (UKF)**: Implemented with numerically-stable updates.
-- **Particle Filters**: Bootstrap PF and PF-PF (Particle Flow Proposal) with global (IEDH) and local (ILEDH / LEDH) invertible Daum–Huang flows.
-- **Flows & Diagnostics**: Robust linear-algebra helpers (`_safe_cholesky`, `_safe_inv`) with optional debug tracing (`PF_PF_DEBUG` env var).
-- **Experiments**: `experiments_pf_pf.py` contains comparison experiments and a sensitivity study `experiment_linear_gaussian_part2` that perturbs predictive covariances.
+- **Particle flows:**: Implementations of EDH (global linearization) and LEDH (local linearization) particle-flow filters.
+- **Kernel flows:**: KernelScalarFlow and KernelMatrixFlow implementations with single-step and sequential `filter` APIs.
+- **Particle filter:**: A standard particle filter with predict/update/resample routines and a convenience `filter` API for sequential observations.
+- **Data generators:**: `StochasticVariationalData` supports multi-dimensional state and observation generation for repeatable experiments.
+- **Notebooks & demos:**: Interactive experiments for comparing filters and visualizing particle behavior.
 
-**Quick Notes**
-- **Debug**: set `PF_PF_DEBUG=1` to enable diagnostic prints from PF-PF helpers (shows min eigenvalues and jitter escalation). In PowerShell: `$env:PF_PF_DEBUG='1'`.
-- **Smoke tests**: many experiments support a `smoke` flag or small defaults for quick validation.
+**Requirements**
+- **Python:**: 3.8+ recommended (code tested with Python 3.11 in the development environment).
+- **Core packages:**: Installable from `test-requirements.txt` for a reproducible environment. Typical packages include `numpy`, `scipy`, `matplotlib`, `tensorflow`, `tensorflow-probability`, and `pytest`.
 
-**Project Structure**
-- **`src/models/`**: Kalman, EKF, UKF, ParticleFilter, PF_PF (flows), EDH, LEDH implementations.
-- **`experiments_pf_pf.py`**: experiment harnesss (acoustic tracking, linear Gaussian spatial network, skewed-t counts) and the sensitivity experiment `experiment_linear_gaussian_part2`.
-- **`test/`**: unit tests.
-
-**Dependencies**
-- Python 3.8+; tested with Python 3.11
-- Required (examples): `numpy`, `tensorflow`, `tensorflow_probability`, `scipy`
-- Install with pip (recommended in a venv):
+Quick setup (recommended)
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r test-requirements.txt
+# Optionally install the package in editable mode
 python -m pip install -e .
-python -m pip install "tensorflow>=2.10" "tensorflow-probability>=0.18" scipy
 ```
 
-**Running experiments**
-- Run the default experiments script (calls `experiment_linear_gaussian` by default):
+If you prefer installing only runtime dependencies, ensure `tensorflow` and `tensorflow-probability` are installed for TF-based demos:
 ```powershell
-python experiments_pf_pf.py
+python -m pip install tensorflow tensorflow-probability
 ```
-- Run the sensitivity experiment (perturbed predictive covariance) from Python:
+
+**Running tests**
+- Run the test suite with:
 ```powershell
-python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=10, trials=5, Np=500, sigma_p_list=[0.0,0.1,0.2], smoke=False)"
+python -m pytest -q
 ```
-- Quick smoke test (fast):
+
+**Running demos & examples**
+- KernelFlow smoke test (single-script demo):
 ```powershell
-python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=3, trials=2, Np=50, sigma_p_list=[0.0,0.2], smoke=True)"
+python src\models\KernelFlow.py
 ```
-
-**Enabling PF-PF diagnostics**
-- PowerShell:
+- Particle-flow PF demo / smoke test:
 ```powershell
-$env:PF_PF_DEBUG='1'
-python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=5, trials=2, Np=200, sigma_p_list=[0.0,0.2], smoke=True)"
+python src\models\PFPF.py
 ```
-- Bash/macOS/Linux:
-```bash
-PF_PF_DEBUG=1 python -c "from experiments_pf_pf import experiment_linear_gaussian_part2; experiment_linear_gaussian_part2(T=5, trials=2, Np=200, sigma_p_list=[0.0,0.2], smoke=True)"
+- Run the interactive notebook (execute in-place):
+```powershell
+jupyter nbconvert --execute experiments_part_1.ipynb --to notebook --inplace
 ```
 
-**Notes on numerical stability**
-- The PF-PF flows use Cholesky and matrix inversions; we add tiny diagonal jitter and attempt increasing jitter when operations fail. Use `PF_PF_DEBUG=1` to see jitter/diagnostic messages.
-- For large `d` and large `Np` experiments, prefer running smoke/medium runs first to confirm numerical stability and resource usage.
+**Code Usage Examples**
+- Run a quick particle-filter sequence (Python REPL or script):
+```python
+from src.models.ParticleFilter import ParticleFilter
+# construct ParticleFilter, provide model functions, initial particles, and observations
+# pf.filter(observations) returns stacked means, covariances and log-likelihoods
+```
+- Use kernel flow to filter a sequence:
+```python
+from src.models.KernelFlow import KernelScalarFlow
+kf = KernelScalarFlow(kernel_param=1.0)
+means, covs, lls = kf.filter(observations, particles, H, R, h_func=my_h)
+```
 
-If you'd like, I can:
-- add capture-and-save for matrices that trigger jitter escalation, or
-- run the full-scale sensitivity experiment (trials=100, T=10, Np=10000) — note this is computationally heavy and may take a long time.
+**API Summary**
+- `src/models/ParticleFilter.py` — `ParticleFilter` with `.step()` and `.filter()` convenience API.
+- `src/models/PFPF.py` — `EDH_ParticleFlowPF`, `LEDH_ParticleFlowPF` with `step()` and `filter()` APIs for sequential observations.
+- `src/models/KernelFlow.py` — `KernelScalarFlow` and `KernelMatrixFlow` with `flow()` and `filter()`.
+- `src/data/data.py` — `StochasticVariationalData` for synthetic data generation supporting `n_state` and `n_obs`.
 
-## Contributing
-Follow the normal fork → branch → PR workflow. Keep changes small and test locally with smoke runs before pushing.
+**Notes & Known Issues**
+- Parity between EDH and LEDH particle-flow variants may not be exact for all settings; the repository includes a parity self-test that may highlight differences requiring algorithmic investigation.
+- Some module entry points and convenience functions use TensorFlow-to-NumPy conversions for simplicity; converting to fully TF-graph-based implementations is left as future work.
 
-## License
-MIT — see `LICENSE`.
+**Contributing**
+- Contributions are welcome. Please open issues or pull requests.
+- For code changes, add tests in the `test/` directory and keep changes minimal and focused.
+
+**License**
+- See the `LICENSE` file at the repository root for license details.
+
+**Contact / Maintainer**
+- Repository owner: `Yechang618` (local workspace).
+
+**Next steps**
+- Run the test suite locally: `python -m pytest -q`.
+- If you want, I can help debug the EDH vs LEDH parity issue and propose a fix or more diagnostic tests.

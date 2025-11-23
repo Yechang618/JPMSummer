@@ -23,7 +23,7 @@ import scipy.stats
 import tensorflow as tf
 import tensorflow_probability as tfp
 
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '2'
 tf.random.set_seed(42)
 
 tfb = tfp.bijectors
@@ -127,6 +127,7 @@ class SSMData:
             y = y.write(t - 1, y_t)
 
         return x.stack(), y.stack()
+    
 if __name__ == "__main__":
     # Simple demo of SSMData
     import numpy as np
@@ -325,69 +326,139 @@ class StochasticVolatilityData:
         return h.stack(), y.stack()
 
 class StochasticVariationalData:
-    """A simple stochastic variational model data generator.
+    """A stochastic variational model data generator supporting multivariate
 
-    Implements the model
-        X_k = alpha * X_{k-1} + sigma * eta_k,   eta_k ~ N(0,1)
-        Y_k = beta * exp(X_k / 2) * epsilon_k,   epsilon_k ~ N(0,1)
-
-    This is a scalar (1D) latent state / observation implementation.
+    Model (vectorized):
+        X_k = alpha * X_{k-1} + sigma * eta_k,   eta_k ~ N(0, I)
+        Z_k = beta * exp(X_k / 2) * eps_k        (elementwise)
+        Y_k = C @ Z_k                            (optional linear map to obs dim)
 
     Parameters
     ----------
-    alpha : float
-        AR(1) coefficient for the latent state
-    sigma : float
-        Scale of the process noise (multiplies standard normal eta)
-    beta : float
-        Observation scale factor (multiplies exp(X_k/2) and observation noise)
-    initial_state : float, optional
-        Initial latent state X_0 (defaults to 0.0)
+    alpha : float or array-like (length n_state)
+        AR(1) coefficients applied elementwise to state.
+    sigma : float or array-like (length n_state)
+        Scale(s) of the process noise (elementwise).
+    beta : float or array-like (length n_state)
+        Observation scale(s) applied to each state channel before mapping to
+        observation space.
+    n_state : int
+        Dimension of the latent state X_k (default 1 for backward compatibility).
+    n_obs : Optional[int]
+        Dimension of the observations. If None, defaults to `n_state`.
+    observation_matrix : optional array-like, shape (n_obs, n_state)
+        If provided, maps the per-state contributions into observation space via
+        matrix multiplication: y = C @ (beta * exp(X/2) * eps). If omitted and
+        `n_obs != n_state` a ValueError is raised.
+    initial_state : Optional[array-like]
+        Initial latent state (length `n_state`). If None, defaults to zeros.
     dtype : tf.DType, default tf.float64
     """
+
     def __init__(
         self,
-        alpha: float,
-        sigma: float,
-        beta: float,
-        initial_state: Optional[float] = 0.0,
+        alpha,
+        sigma,
+        beta,
+        n_state: int = 1,
+        n_obs: Optional[int] = None,
+        observation_matrix: Optional[object] = None,
+        initial_state: Optional[object] = None,
         dtype: tf.DType = tf.float64,
     ) -> None:
         self.dtype = dtype
-        self.alpha = tf.convert_to_tensor(alpha, dtype=self.dtype)
-        self.sigma = tf.convert_to_tensor(sigma, dtype=self.dtype)
-        self.beta = tf.convert_to_tensor(beta, dtype=self.dtype)
+        self.n_state = int(n_state)
+        if n_obs is None:
+            self.n_obs = int(self.n_state)
+        else:
+            self.n_obs = int(n_obs)
+
+        # Convert parameters to tensors with appropriate shapes
+        alpha_arr = np.asarray(alpha)
+        if alpha_arr.size == 1:
+            alpha_vec = np.full((self.n_state,), float(alpha_arr))
+        else:
+            alpha_vec = np.asarray(alpha_arr, dtype=float)
+            if alpha_vec.shape[0] != self.n_state:
+                raise ValueError("alpha must be scalar or length n_state")
+
+        sigma_arr = np.asarray(sigma)
+        if sigma_arr.size == 1:
+            sigma_vec = np.full((self.n_state,), float(sigma_arr))
+        else:
+            sigma_vec = np.asarray(sigma_arr, dtype=float)
+            if sigma_vec.shape[0] != self.n_state:
+                raise ValueError("sigma must be scalar or length n_state")
+
+        beta_arr = np.asarray(beta)
+        if beta_arr.size == 1:
+            beta_vec = np.full((self.n_state,), float(beta_arr))
+        else:
+            beta_vec = np.asarray(beta_arr, dtype=float)
+            if beta_vec.shape[0] != self.n_state:
+                raise ValueError("beta must be scalar or length n_state")
+
+        self.alpha = tf.convert_to_tensor(alpha_vec, dtype=self.dtype)
+        self.sigma = tf.convert_to_tensor(sigma_vec, dtype=self.dtype)
+        self.beta = tf.convert_to_tensor(beta_vec, dtype=self.dtype)
+
+        if observation_matrix is not None:
+            C = tf.convert_to_tensor(observation_matrix, dtype=self.dtype)
+            if C.shape[0] != self.n_obs or C.shape[1] != self.n_state:
+                raise ValueError("observation_matrix must have shape (n_obs, n_state)")
+            self.C = C
+        else:
+            self.C = None
+            if self.n_obs != self.n_state:
+                raise ValueError("n_obs must equal n_state when observation_matrix is not provided")
+
         if initial_state is None:
-            initial_state = 0.0
-        self.initial_state = tf.convert_to_tensor(initial_state, dtype=self.dtype)
+            init = np.zeros((self.n_state,), dtype=float)
+        else:
+            init = np.asarray(initial_state, dtype=float)
+            if init.shape != (self.n_state,):
+                raise ValueError("initial_state must have shape (n_state,)")
+
+        self.initial_state = tf.convert_to_tensor(init, dtype=self.dtype)
 
     def sample(self, num_steps: int, seed: Optional[int] = None) -> Tuple[tf.Tensor, tf.Tensor]:
-        """Generate samples of latent states and observations.
+        """Generate multivariate samples of latent states and observations.
 
         Returns
         -------
-        x : tf.Tensor, shape (num_steps + 1,)
+        x : tf.Tensor, shape (num_steps + 1, n_state)
             Latent states (including initial state at index 0)
-        y : tf.Tensor, shape (num_steps,)
+        y : tf.Tensor, shape (num_steps, n_obs)
             Observations
         """
         x = tf.TensorArray(dtype=self.dtype, size=num_steps + 1, clear_after_read=False)
         y = tf.TensorArray(dtype=self.dtype, size=num_steps, clear_after_read=False)
 
-        x = x.write(0, self.initial_state)
+        x = x.write(0, tf.cast(self.initial_state, dtype=self.dtype))
 
+        # Precreate distributions per-step using diagonal covariances when possible
         for t in range(1, num_steps + 1):
             if seed is not None:
-                eta = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(seed=seed + t), dtype=self.dtype)
-                eps = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(seed=seed + t + num_steps), dtype=self.dtype)
+                eta = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_state, dtype=self.dtype), scale_diag=self.sigma).sample(seed=seed + t)
+                eps = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_state, dtype=self.dtype), scale_diag=tf.ones(self.n_state, dtype=self.dtype)).sample(seed=seed + t + num_steps)
             else:
-                eta = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(), dtype=self.dtype)
-                eps = tf.cast(tfd.Normal(loc=0.0, scale=1.0).sample(), dtype=self.dtype)
+                eta = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_state, dtype=self.dtype), scale_diag=self.sigma).sample()
+                eps = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_state, dtype=self.dtype), scale_diag=tf.ones(self.n_state, dtype=self.dtype)).sample()
 
             x_prev = x.read(t - 1)
+            # elementwise AR(1)
             x_t = self.alpha * x_prev + self.sigma * eta
             x = x.write(t, x_t)
-            y_t = self.beta * tf.exp(x_t / 2.0) * eps
+
+            # per-state scaled volatility and multiplicative noise
+            vol = self.beta * tf.exp(x_t / 2.0)
+            z = vol * eps  # shape (n_state,)
+
+            if self.C is not None:
+                y_t = tf.linalg.matvec(self.C, z)
+            else:
+                y_t = z
+
             y = y.write(t - 1, y_t)
 
         return x.stack(), y.stack()

@@ -78,6 +78,9 @@ class KalmanFilter:
         assert self.H.shape[1] == self.state_dim
         assert self.R.shape == (self.obs_dim, self.obs_dim)
 
+        # Diagnostics: condition number history for the innovation covariance S
+        self.cond_history = []  # list of floats (per-time-step condition numbers)
+
     def filter(self, observations: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """Run the Kalman filter on a sequence of observations.
 
@@ -123,20 +126,42 @@ class KalmanFilter:
             y_pred = tf.linalg.matvec(self.H, m_pred)
             S = self.H @ P_pred @ tf.transpose(self.H) + self.R
 
-            # Numerically stable inverse using cholesky
+            # Track condition number of S (innovation covariance)
+            try:
+                svals = tf.linalg.svd(S, compute_uv=False)
+                smax = tf.reduce_max(svals)
+                smin = tf.reduce_min(svals)
+                eps = tf.cast(1e-12, dtype=self.dtype)
+                cond_S = tf.cast(smax / (smin + eps), dtype=self.dtype)
+                # store as Python float
+                try:
+                    self.cond_history.append(float(cond_S.numpy()))
+                except Exception:
+                    # fallback if tensor has no .numpy()
+                    self.cond_history.append(float(cond_S))
+            except Exception:
+                # If SVD fails for any reason, append NaN
+                try:
+                    import math
+                    self.cond_history.append(math.nan)
+                except Exception:
+                    self.cond_history.append(float('nan'))
+
+            # Numerically stable inverse using Cholesky factorization
             chol_S = tf.linalg.cholesky(S)
-            # Kalman gain: K = P_pred H^T S^{-1}
-            # Solve S * X = H * P_pred^T^T  => use triangular_solve
-            # compute K = P_pred @ H^T @ S^{-1}
-            K = tf.linalg.matmul(P_pred, tf.transpose(self.H))
-            K = tf.linalg.cholesky_solve(chol_S, tf.transpose(K))
-            K = tf.transpose(K)
+            # Compute S^{-1} via cholesky_solve applied to identity
+            S_inv = tf.linalg.cholesky_solve(chol_S, tf.eye(self.obs_dim, dtype=self.dtype))
+            # Kalman gain: K = P_pred @ H^T @ S^{-1}
+            K = P_pred @ tf.transpose(self.H) @ S_inv
 
             innovation = y - y_pred
 
             # Update
             m = m_pred + tf.linalg.matvec(K, innovation)
             KH = K @ self.H
+            # Sanity check shapes before covariance update to give clearer error messages
+            if P_pred.shape[0] != self.state_dim or P_pred.shape[1] != self.state_dim:
+                raise ValueError(f"P_pred has wrong shape {P_pred.shape}, expected ({self.state_dim},{self.state_dim})")
             P = (I - KH) @ P_pred @ tf.transpose(I - KH) + KH @ self.R @ tf.transpose(KH)  # Joseph form
 
             # Log-likelihood contribution
@@ -145,6 +170,17 @@ class KalmanFilter:
 
             filtered_means = filtered_means.write(t, m)
             filtered_covs = filtered_covs.write(t, P)
+            if self.verbose:
+                try:
+                    t_val = int(t.numpy())
+                except Exception:
+                    t_val = int(t)
+                # print condition number for diagnostics
+                try:
+                    cond_val = self.cond_history[-1]
+                except Exception:
+                    cond_val = None
+                print(f"KalmanFilter: step={t_val} cond(S)={cond_val}")
 
         filtered_means = filtered_means.stack()
         filtered_covs = filtered_covs.stack()
