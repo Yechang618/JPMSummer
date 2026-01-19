@@ -57,102 +57,174 @@ def safe_inv(matrix, jitter=1e-6):
         return tf.linalg.cholesky_solve(L, tf.eye(dim, dtype=dtype))
 
 
+
 # =============================================================================
 # 1. Standard Particle Filter (with resampling)
 # =============================================================================
-
 class StandardParticleFilter:
-    def __init__(self, f, Q, initial_mean, initial_cov, num_particles=3000, seed=42, beta=1.0):
+    def __init__(
+        self,
+        f,
+        h,
+        Q,
+        R,
+        initial_mean,
+        initial_cov,
+        num_particles=3000,
+        seed=42,
+        dtype=tf.float64
+    ):
+        """
+        Standard Bootstrap Particle Filter implemented in TensorFlow.
+        """
         self.f = f
-        self.Q = Q
-        self.beta = beta
+        self.h = h
+        self.dtype = dtype
         self.num_particles = num_particles
-        self.rng = np.random.default_rng(seed)
-        # Normalize inputs to arrays
-        if np.isscalar(initial_mean):
-            self.initial_mean = np.array([float(initial_mean)])
-            if np.isscalar(initial_cov):
-                self.initial_cov = np.array([[float(initial_cov)]])
+        self.seed = seed
+        self.rng = tf.random.Generator.from_seed(seed)
+
+        # Convert to tensors
+        self.initial_mean = tf.convert_to_tensor(initial_mean, dtype=self.dtype)
+        self.initial_cov = tf.convert_to_tensor(initial_cov, dtype=self.dtype)
+        self.state_dim = tf.shape(self.initial_mean)[0]
+
+        self.Q = tf.convert_to_tensor(Q, dtype=self.dtype)
+        self.R = tf.convert_to_tensor(R, dtype=self.dtype)
+
+        # Check if Q is effectively diagonal
+        if tf.rank(self.Q) == 2:
+            diag_Q = tf.linalg.diag_part(self.Q)
+            # If off-diagonals are near zero, treat as diagonal
+            off_diag_norm = tf.norm(self.Q - tf.linalg.diag(diag_Q))
+            if off_diag_norm < 1e-10:
+                self.Q_diag = diag_Q
+                self.Q_is_diagonal = True
             else:
-                self.initial_cov = np.array(initial_cov).reshape(1, 1)
+                self.Q_is_diagonal = False
         else:
-            self.initial_mean = np.array(initial_mean)
-            self.initial_cov = np.array(initial_cov)
+            self.Q_is_diagonal = True
+            self.Q_diag = tf.sqrt(self.Q) * tf.ones(self.state_dim, dtype=self.dtype)
         
-                
-        self.particles = self.rng.multivariate_normal(
-            mean=self.initial_mean,
-            cov=self.initial_cov,
-            size=num_particles
+        # Determine observation dimension and noise type
+        if tf.rank(self.R) == 0:
+            self.R_type = "scalar"
+            self.R_val = self.R
+        elif tf.linalg.diag_part(self.R) == tf.reshape(self.R, [-1]):  # Check if diagonal
+            self.R_type = "diagonal"
+            self.R_diag = tf.linalg.diag_part(self.R)  # (dy,)
+        else:
+            self.R_type = "full"       
+
+        # Determine observation dimension
+        if tf.rank(self.R) == 0:
+            self.obs_dim = 1
+        else:
+            self.obs_dim = tf.shape(self.R)[0]
+        # Initialize particles
+        chol_P0 = tf.linalg.cholesky(self.initial_cov)
+        mvn_init = tfp.distributions.MultivariateNormalTriL(
+            loc=self.initial_mean,
+            scale_tril=chol_P0
         )
-        self.weights = np.ones(num_particles) / num_particles
+        # Generate proper [2,] seed
+        # seed_tensor = self.rng.make_seeds(1)[0]
+        self.particles = mvn_init.sample(self.num_particles, seed=seed)
+
+        self.weights = tf.ones(self.num_particles, dtype=self.dtype) / tf.cast(self.num_particles, self.dtype)
         self.ess_history = []
 
+    # @tf.function
     def predict(self):
-        if np.isscalar(self.Q):
-            # 1D case: scalar variance
-            noise = self.rng.normal(scale=np.sqrt(self.Q), size=self.num_particles)
-        else:
-            # Multivariate case: covariance matrix
-            noise = self.rng.multivariate_normal(
-                mean=np.zeros(self.Q.shape[0]),
-                cov=self.Q,
-                size=self.num_particles
+        if self.Q_is_diagonal:
+            # Sample independent noise per dimension
+            noise = self.rng.normal(
+                shape=[self.num_particles, self.state_dim],
+                stddev=tf.sqrt(self.Q_diag),  # (d,) vector
+                dtype=self.dtype
             )
+        else:
+            # Full covariance
+            chol_Q = tf.linalg.cholesky(self.Q)
+            mvn_q = tfp.distributions.MultivariateNormalTriL(
+                loc=tf.zeros(self.state_dim, dtype=self.dtype),
+                scale_tril=chol_Q
+            )
+            seed_tensor = self.rng.make_seeds(1)[0]
+            noise = mvn_q.sample(self.num_particles, seed=seed_tensor)
         self.particles = self.f(self.particles) + noise
 
+    # @tf.function
     def update(self, observation):
-        # observation: (d,)
-        # Compute predicted observation for each particle
-        if self.particles.ndim == 1:
-            particles = self.particles[None, :]  # (1, d)
-        else:
-            particles = self.particles  # (N, d)
+        observation = tf.convert_to_tensor(observation, dtype=self.dtype)
+        obs_pred = self.h(self.particles)  # (N, dy)
+        diff = observation - obs_pred      # (N, dy)
 
-        # Observation model: [x1^2, sin(x2), x3^2, ...]
-        obs_pred = np.empty_like(particles)
-        for i in range(particles.shape[1]):
-            if i % 2 == 0:
-                obs_pred[:, i] = particles[:, i] ** 2
-            else:
-                obs_pred[:, i] = np.sin(particles[:, i])
+        # Use TF constant for pi to match dtype
+        pi = tf.constant(np.pi, dtype=self.dtype)
 
-        # Assume R = I (Gaussian noise); extend to Student-t if needed
-        diff = observation - obs_pred  # (N, d)
-        log_lik = -0.5 * np.sum(diff ** 2, axis=1)  # log N(obs | h(x), I)
+        if self.R_type == "scalar":
+            mahal_sq = tf.reduce_sum(diff ** 2, axis=1) / self.R_val
+            log_norm_const = -0.5 * tf.cast(self.obs_dim, self.dtype) * tf.math.log(2 * pi * self.R_val)
 
-        # Update weights
-        max_log_lik = np.max(log_lik)
-        self.weights *= np.exp(log_lik - max_log_lik)
-        self.weights += 1e-300
-        self.weights /= np.sum(self.weights)
+        elif self.R_type == "diagonal":
+            inv_R_diag = 1.0 / self.R_diag  # (dy,)
+            mahal_sq = tf.reduce_sum(diff ** 2 * inv_R_diag, axis=1)  # (N,)
+            log_norm_const = -0.5 * (
+                tf.cast(self.obs_dim, self.dtype) * tf.math.log(2 * pi) + 
+                tf.reduce_sum(tf.math.log(self.R_diag))
+            )
+
+        else:  # full
+            jitter = tf.eye(tf.shape(self.R)[0], dtype=self.dtype) * 1e-12
+            R_jittered = self.R + jitter
+            L = tf.linalg.cholesky(R_jittered)
+            z = tf.linalg.triangular_solve(L, tf.transpose(diff))  # (dy, N)
+            mahal_sq = tf.reduce_sum(z ** 2, axis=0)  # (N,)
+            log_det_R = tf.reduce_sum(tf.math.log(tf.linalg.diag_part(R_jittered)))
+            log_norm_const = -0.5 * (
+                tf.cast(self.obs_dim, self.dtype) * tf.math.log(2 * pi) + log_det_R
+            )
+
+
+
+        log_lik = log_norm_const - 0.5 * mahal_sq
+
+        # Update weights with log-sum-exp trick
+        max_log_lik = tf.reduce_max(log_lik)
+        self.weights *= tf.exp(log_lik - max_log_lik)
+        self.weights += 1e-30
+        self.weights /= tf.reduce_sum(self.weights)
 
         # ESS
-        ess = 1.0 / np.sum(self.weights ** 2)
-        self.ess_history.append(ess)
+        ess = 1.0 / tf.reduce_sum(self.weights ** 2)
 
         # Resample if needed
         if ess < self.num_particles / 2:
-            u0 = self.rng.random() / self.num_particles
-            positions = (u0 + np.arange(self.num_particles)) % 1
-            cumsum_weights = np.cumsum(self.weights)
-            indices = np.searchsorted(cumsum_weights, positions)
-            self.particles = self.particles[indices]
-            self.weights = np.ones(self.num_particles) / self.num_particles
+            u0 = self.rng.uniform([], maxval=1.0 / self.num_particles, dtype=self.dtype)
+            positions = (u0 + tf.range(self.num_particles, dtype=self.dtype)) % 1.0
+            cumsum_weights = tf.cumsum(self.weights)
+            indices = tf.searchsorted(cumsum_weights, positions, side='right')
+            self.particles = tf.gather(self.particles, indices)
+            self.weights = tf.ones(self.num_particles, dtype=self.dtype) / tf.cast(self.num_particles, self.dtype)
 
     def estimate(self):
-        mean = np.sum(self.weights[:, None] * self.particles, axis=0)
-        return mean
+        return tf.reduce_sum(self.weights[:, None] * self.particles, axis=0)
 
     def filter(self, observations):
+        observations = tf.convert_to_tensor(observations, dtype=self.dtype)
+        T = tf.shape(observations)[0]
         means = []
-        for y in observations:
-            self.predict()
-            self.update(y)
-            m = self.estimate()
-            means.append(m)
-        return np.array(means)
 
+        for t in range(T):
+            self.predict()
+            self.update(observations[t])
+            ess = 1.0 / tf.reduce_sum(self.weights ** 2)
+            self.ess_history.append(ess.numpy())
+            m = self.estimate()
+            means.append(m.numpy())
+
+        return np.array(means)
 
 # =============================================================================
 # 2. EDH Flow (Exact Daum-Huang, global covariance)
@@ -980,11 +1052,6 @@ class PFPF_EDH:
             solved = tf.linalg.solve(R, innov_col)   # (dy, 1)
             # solved = tf.squeeze(solved_col, axis=-1)    # (dy,)
 
-            # --- FIX: Make RHS 2D for tf.linalg.solve ---
-            # rhs_vec = z_obs - e  # (dy,)
-            # rhs = tf.expand_dims(rhs_vec, axis=-1)  # (dy, 1)
-            # solved = tf.linalg.solve(R, rhs)  # (dy, 1)
-            # solved = tf.squeeze(solved, axis=-1)  # (dy,)
             x_bar_col = tf.expand_dims(x_bar, axis=-1)  # (dx, 1)
 
             term1 = (tf.eye(self.dx, dtype=self.dtype) + lambd*A) @ P_pred @ tf.transpose(H) @ solved  # (dx,)

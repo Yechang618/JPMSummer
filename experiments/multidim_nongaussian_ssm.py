@@ -129,6 +129,18 @@ def dh_dx(x):
         J = tf.squeeze(J, axis=0)  # (d, d)
     return J
 
+# Observation model for Lorenz-96: [x1^2, sin(x2), x3^2, ...]
+def h_pf(x):
+    """x: (N, d) → returns (N, d)"""
+    x = np.asarray(x)
+    obs = np.empty_like(x)
+    for i in range(x.shape[1]):
+        if i % 2 == 0:
+            obs[:, i] = x[:, i] ** 2
+        else:
+            obs[:, i] = np.sin(x[:, i])
+    return obs
+
 
 # =============================================================================
 # Main experiment
@@ -159,10 +171,20 @@ def main():
 
     # --- Standard PF (scalar observation only) ---
     print("Running Standard Particle Filter (PF)...")
+    # Observation noise covariance (diagonal, scale=0.2 → variance=0.04)
+    R = np.eye(dim) * (0.2 ** 2)  # matches df_obs scale in data generation
     tracemalloc.start()
     start = time.time()
-    pf = StandardParticleFilter(f=lambda x: ssm.lorenz96_step(x), Q=Q, initial_mean=m0, initial_cov=P0,
-                                num_particles=5000, seed=seed, beta=1.0)
+    pf = StandardParticleFilter(
+        f=lambda x: ssm.lorenz96_step(x),
+        h=h_pf,          
+        Q=Q,
+        R=R,             
+        initial_mean=m0,
+        initial_cov=P0,
+        num_particles=5000,
+        seed=seed
+    )
     pf_means = pf.filter(obs_y[:, 0])
     end = time.time()
     current, peak = tracemalloc.get_traced_memory()
@@ -341,9 +363,6 @@ def main():
         if name not in results:
             continue
         est = results[name]
-        # if name in ['PF', 'EDH', 'LEDH']:
-        #     rmse = np.sqrt(np.mean((est - true_x[:, 0])**2))
-        # else:
         rmse = np.sqrt(np.mean((est - true_x)**2))
         rmse_values.append(rmse)
 

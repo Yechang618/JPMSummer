@@ -39,20 +39,6 @@ from models.particle_filters import (
 )
 
 # ----------------------------
-# 1. SVM Data Generator
-# ----------------------------
-
-def generate_svm_data(T=200, alpha=0.95, sigma=0.2, beta=1.0, seed=42):
-    rng = np.random.default_rng(seed)
-    x = np.zeros(T + 1)
-    y = np.zeros(T)
-    x[0] = 0.0
-    for t in range(1, T + 1):
-        x[t] = alpha * x[t - 1] + sigma * rng.normal()
-        y[t - 1] = beta * np.exp(x[t] / 2) * rng.normal()
-    return x[1:], y  # (T,), (T,)
-
-# ----------------------------
 # 2. Observation Model for PFPF/DH & UKF
 # ----------------------------
 
@@ -300,10 +286,11 @@ def main():
 
     # --- Figure 3: Observations ---
     plt.figure(figsize=(10, 4))
-    plt.plot(t, obs_y, 'ko', markersize=2, alpha=0.7)
+    plt.plot(t, true_x, 'r-', label='True $x_t$', linewidth=2)
+    plt.plot(t, obs_y, 'ko', label='Observed $y_t$', markersize=2, alpha=0.7)
     plt.xlabel('Time'); plt.ylabel('$y_t$')
     plt.title('SVM Observations')
-    plt.grid(True)
+    plt.legend(); plt.grid(True)
     plt.tight_layout()
     plt.savefig("./figures/svm_observations.pdf", dpi=150)
     plt.show()

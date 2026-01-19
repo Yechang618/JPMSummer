@@ -43,8 +43,8 @@ def dgamma_dx(x):
     r_sq = x_pos**2 + y_pos**2
     
     # Stronger regularization for near-origin
-    r_safe = tf.sqrt(r_sq + 1e-4)  # was 1e-8, now 1e-4
-    r_sq_safe = r_sq + 1e-4        # was 1e-8, now 1e-4
+    r_safe = tf.sqrt(r_sq + 1e-4)  
+    r_sq_safe = r_sq + 1e-4        
     
     dr_dx = x_pos / r_safe
     dr_dy = y_pos / r_safe
@@ -60,7 +60,7 @@ def dgamma_dx(x):
 def dgamma_dx_batch(x):
     """Batch Jacobian for PFPF_LEDH (x: [N, 4])"""
     if x.shape.ndims == 1:
-        return dgamma_dx(x)  # Use original for single particle
+        return dgamma_dx(x)  
     
     x_pos = x[:, 0]  # (N,)
     y_pos = x[:, 1]  # (N,)
@@ -109,9 +109,8 @@ x0_mean = ssm.initial_state.numpy()
 P0 = np.eye(4) * 1.0
 
 # --- EKF ---
-# --- EKF ---
 ekf = ExtendedKalmanFilter(
-    f=lambda x: tf.linalg.matvec(A, x),  # ✅ safe for 1D tensors
+    f=lambda x: tf.linalg.matvec(A, x),  
     h=gamma,
     Q=Q, R=R,
     initial_mean=x0_mean,
@@ -144,22 +143,43 @@ ukf_rmse = np.sqrt(np.mean((x_true - ukf_means)**2))
 N_PARTICLES = 1000
 seed = 42
 
-# Helper: linear dynamics
 def f_particle(x):
-    return A @ x
+    return x @ A.T  # A is (4,4); x is (N,4)
 
-# --- Standard PF ---
+# Observation model
+def h_pf(x):
+    x_pos = x[:, 0]
+    y_pos = x[:, 1]
+    r = tf.sqrt(x_pos**2 + y_pos**2)
+    b = tf.math.atan2(y_pos, x_pos)
+    return tf.stack([r, b], axis=-1)  # (N, 2)
+
+# Extract diagonal of Q for PF
+Q_diag = np.diag(Q)  # (4,)
+
 pf = StandardParticleFilter(
     f=f_particle,
-    Q=Q,
+    h=h_pf,
+    Q=Q_diag,  
+    R=R,
     initial_mean=x0_mean,
     initial_cov=P0,
-    num_particles=N_PARTICLES,
-    seed=seed
+    num_particles=1000,
+    seed=42,
+    dtype=tf.float64
 )
 
-Psi = A          # already float64 from RangeBearingSSM
-Q_mat = Q        # same
+# Run
+pf_est = pf.filter(y_obs)  # y_obs: (T, 2)
+# --- Standard PF ---
+print("Running Standard Particle Filter...")
+start = time.time()
+pf_est = pf.filter(y_obs)  # Returns (T, 4) array of mean estimates
+pf_time = time.time() - start
+pf_rmse = np.sqrt(np.mean((x_true - pf_est)**2))
+
+Psi = A          
+Q_mat = Q        
 R_mat = R
 x0_mean_f64 = x0_mean
 P0_f64 = P0
@@ -241,18 +261,46 @@ ekf_means = ekf_means.numpy()  # ✅ convert to NumPy
 ukf_means, _, _ = ukf.filter(y_obs, true_states=x_true)
 ukf_means = ukf_means.numpy()
 
-# DH outputs are already NumPy (from .numpy() in loop)
-
 # Now safe to use list indexing
 pos_idx = [0, 1]
 
 print("\n=== RMSE (position only) ===")
 print(f"EKF          : {np.sqrt(np.mean((x_true[:,pos_idx] - ekf_means[:,pos_idx])**2)):.4f}")
 print(f"UKF          : {np.sqrt(np.mean((x_true[:,pos_idx] - ukf_means[:,pos_idx])**2)):.4f}")
+print(f"PF           : {np.sqrt(np.mean((x_true[:,pos_idx] - pf_est[:,pos_idx])**2)):.4f}") 
 print(f"EDH     : {np.sqrt(np.mean((x_true[:,pos_idx] - dh1_est[:,pos_idx])**2)):.4f}")
 print(f"LEDH     : {np.sqrt(np.mean((x_true[:,pos_idx] - dh2_est[:,pos_idx])**2)):.4f}")
 print(f"PFPF-EDH     : {np.sqrt(np.mean((x_true[:,pos_idx] - pfpf_edh_est[:,pos_idx])**2)):.4f}")
 print(f"PFPF-LEDH    : {np.sqrt(np.mean((x_true[:,pos_idx] - pfpf_ledh_est[:,pos_idx])**2)):.4f}")
+
+# =============================================================================
+# 5. Results: Print RMSE and Execution Time
+# =============================================================================
+
+pos_idx = [0, 1]
+
+# Compute position RMSE for all methods
+ekf_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - ekf_means[:, pos_idx])**2))
+ukf_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - ukf_means[:, pos_idx])**2))
+pf_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - pf_est[:, pos_idx])**2))
+dh1_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - dh1_est[:, pos_idx])**2))
+dh2_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - dh2_est[:, pos_idx])**2))
+pfpf_edh_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - pfpf_edh_est[:, pos_idx])**2))
+pfpf_ledh_rmse_pos = np.sqrt(np.mean((x_true[:, pos_idx] - pfpf_ledh_est[:, pos_idx])**2))
+
+print("\n" + "="*80)
+print("RANGE-BEARING FILTERING PERFORMANCE COMPARISON")
+print("="*80)
+print(f"{'Method':12s} | {'Time (s)':>8s} | {'Pos RMSE':>9s}")
+print("-" * 80)
+print(f"{'EKF':12s} | {ekf_time:8.3f} | {ekf_rmse_pos:9.4f}")
+print(f"{'UKF':12s} | {ukf_time:8.3f} | {ukf_rmse_pos:9.4f}")
+print(f"{'PF':12s} | {pf_time:8.3f} | {pf_rmse_pos:9.4f}")
+print(f"{'EDH':12s} | {dh1_time:8.3f} | {dh1_rmse_pos:9.4f}")
+print(f"{'LEDH':12s} | {dh2_time:8.3f} | {dh2_rmse_pos:9.4f}")
+print(f"{'PFPF-EDH':12s} | {pfpf_edh_time:8.3f} | {pfpf_edh_rmse_pos:9.4f}")
+print(f"{'PFPF-LEDH':12s} | {pfpf_ledh_time:8.3f} | {pfpf_ledh_rmse_pos:9.4f}")
+
 # =============================================================================
 # 6. Plotting
 # =============================================================================
@@ -264,6 +312,7 @@ plt.figure(figsize=(8, 8))
 plt.plot(x_true[:, 0], x_true[:, 1], 'k-', label='True', linewidth=2)
 plt.plot(ekf_means[:, 0], ekf_means[:, 1], 'b--', label='EKF')
 plt.plot(ukf_means[:, 0], ukf_means[:, 1], 'g--', label='UKF')
+plt.plot(pf_est[:, 0], pf_est[:, 1], 'y--', label='PF')  
 plt.plot(dh1_est[:, 0], dh1_est[:, 1], 'c-.', label='EDH')
 plt.plot(dh2_est[:, 0], dh2_est[:, 1], 'm-.', label='LEDH')
 plt.plot(pfpf_edh_est[:, 0], pfpf_edh_est[:, 1], color='red', label='PFPF-EDH')
@@ -283,7 +332,9 @@ err_dh1 = np.linalg.norm(x_true[:, :2] - dh1_est[:, :2], axis=1)
 err_dh2 = np.linalg.norm(x_true[:, :2] - dh2_est[:, :2], axis=1)
 err_pfpf_edh = np.linalg.norm(x_true[:, :2] - pfpf_edh_est[:, :2], axis=1)
 err_pfpf_ledh = np.linalg.norm(x_true[:, :2] - pfpf_ledh_est[:, :2], axis=1)
+err_pf = np.linalg.norm(x_true[:, :2] - pf_est[:, :2], axis=1)
 
+plt.plot(t, err_pf, 'y-', label='PF')
 plt.plot(t, err_ekf, 'b-', label='EKF')
 plt.plot(t, err_ukf, 'g-', label='UKF')
 plt.plot(t, err_dh1, 'c-', label='EDH')
@@ -296,10 +347,11 @@ plt.legend(); plt.grid(True)
 plt.savefig("./figures/range_bearing_error.pdf", dpi=150)
 plt.show()
 
-methods = ['EKF', 'UKF', 'EDH', 'LEDH', 'PFPF-EDH', 'PFPF-LEDH']
+methods = ['EKF', 'UKF', 'PF','EDH', 'LEDH', 'PFPF-EDH', 'PFPF-LEDH']
 rmse_vals = [
     np.sqrt(np.mean((x_true[:,pos_idx] - ekf_means[:,pos_idx])**2)),
     np.sqrt(np.mean((x_true[:,pos_idx] - ukf_means[:,pos_idx])**2)),
+    np.sqrt(np.mean((x_true[:,pos_idx] - pf_est[:,pos_idx])**2)),
     np.sqrt(np.mean((x_true[:,pos_idx] - dh1_est[:,pos_idx])**2)),
     np.sqrt(np.mean((x_true[:,pos_idx] - dh2_est[:,pos_idx])**2)),
     np.sqrt(np.mean((x_true[:,pos_idx] - pfpf_edh_est[:,pos_idx])**2)),
